@@ -1,0 +1,7 @@
+<launch>
+    <node pkg="odom_to_mavros" type="odom_to_mavros_node" name="odom_to_mavros" output="screen">
+        <param name="input_topic" value="/Odometry" />
+        <param name="output_topic" value="/mavros/vision_pose/pose" />
+        <param name="frame_id" value="world" />
+    </node>
+</launch>

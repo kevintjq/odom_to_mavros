@@ -1,0 +1,33 @@
+# catkin / ROS build outputs
+build/
+devel/
+install/
+logs/
+log/
+
+# ROS bag / runtime artifacts
+*.bag
+*.bag.active
+*.launch~
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+Makefile
+compile_commands.json
