@@ -1,46 +1,46 @@
 # odom_to_mavros
 
-Forward FAST-LIO `nav_msgs/Odometry` into MAVROS `geometry_msgs/PoseStamped`, with optional 6DoF extrinsic calibration loaded from YAML.
+将 FAST-LIO 输出的 `nav_msgs/Odometry` 转发为 MAVROS 可用的 `geometry_msgs/PoseStamped`，并支持通过 YAML 配置雷达到机体系的 6DoF 外参。
 
-Default output topic:
+默认发布到：
 
 `/mavros/vision_pose/pose`
 
-## What it does
+## 功能
 
-- Subscribes to FAST-LIO odometry
-- Loads lidar-to-body extrinsics from YAML
-- Transforms lidar pose into body pose
-- Publishes full position and quaternion
+- 订阅 FAST-LIO 里程计
+- 从 YAML 读取雷达到机体系外参
+- 将雷达位姿变换到机体系
+- 发布完整的位置和四元数
 
-## Topics and parameters
+## 话题与参数
 
-### Input / output
+### 输入输出
 
-- `input_topic`: input odometry topic, default `/Odometry`
-- `output_topic`: output vision pose topic, default `/mavros/vision_pose/pose`
-- `frame_id`: message frame label, default `world`
+- `input_topic`：输入里程计话题，默认 `/Odometry`
+- `output_topic`：输出视觉位姿话题，默认 `/mavros/vision_pose/pose`
+- `frame_id`：消息头里的坐标系名，默认 `world`
 
-### Extrinsic config
+### 外参配置
 
-Loaded from `config/odom_to_mavros.yaml`:
+外参由 `config/odom_to_mavros.yaml` 加载：
 
 - `extrinsic/translation/x y z`
 - `extrinsic/rotation/roll pitch yaw`
-- `extrinsic/rotation/unit`: `rad` or `deg`
+- `extrinsic/rotation/unit`：`rad` 或 `deg`
 
-Current code expects `T_body_lidar` in YAML:
+当前代码约定 YAML 中填写的是 `T_body_lidar`：
 
-- `translation` is the lidar origin in body frame
-- `rotation` is the lidar frame pose relative to body frame
+- `translation` 表示雷达原点在机体系下的位置
+- `rotation` 表示雷达坐标系相对机体系的姿态
 
-## Launch
+## 启动
 
 ```bash
 roslaunch odom_to_mavros odom_to_mavros.launch
 ```
 
-## Example config
+## 配置示例
 
 ```yaml
 extrinsic:
@@ -55,8 +55,8 @@ extrinsic:
     yaw: 5.0
 ```
 
-## Notes
+## 说明
 
-- This node only republishes odometry and applies frame transforms
-- `frame_id` is a message label only; it does not create TF or trigger transforms
-- If the extrinsic direction is wrong, the output pose will be rotated or shifted
+- 这个节点只做里程计转发和坐标变换，不负责 TF 发布
+- `frame_id` 只是消息标签，不会触发自动坐标变换
+- 如果外参方向填反，输出位姿会整体偏移或旋转
