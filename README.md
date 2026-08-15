@@ -1,54 +1,46 @@
 # odom_to_mavros
 
-将 FAST-LIO 输出的 `nav_msgs/Odometry` 转发为 MAVROS 可用的 `geometry_msgs/PoseStamped`，并支持通过 YAML 配置雷达到机体系的外参。
+Forward FAST-LIO `nav_msgs/Odometry` into MAVROS `geometry_msgs/PoseStamped`, with optional 6DoF extrinsic calibration loaded from YAML.
 
-默认发布到：
+Default output topic:
 
 `/mavros/vision_pose/pose`
 
-## 功能
+## What it does
 
-- 订阅 FAST-LIO / 里程计话题
-- 读取雷达到机体系的 6DoF 外参
-- 将雷达位姿变换到机体系
-- 发布完整位置 + 四元数姿态
+- Subscribes to FAST-LIO odometry
+- Loads lidar-to-body extrinsics from YAML
+- Transforms lidar pose into body pose
+- Publishes full position and quaternion
 
-## 话题与参数
+## Topics and parameters
 
-### 输入输出
+### Input / output
 
-- `input_topic`: 输入里程计话题，默认 `/Odometry`
-- `output_topic`: 输出视觉位姿话题，默认 `/mavros/vision_pose/pose`
-- `frame_id`: 发布消息头中的坐标系名称，默认 `world`
+- `input_topic`: input odometry topic, default `/Odometry`
+- `output_topic`: output vision pose topic, default `/mavros/vision_pose/pose`
+- `frame_id`: message frame label, default `world`
 
-### 外参配置
+### Extrinsic config
 
-外参从 `config/odom_to_mavros.yaml` 加载：
+Loaded from `config/odom_to_mavros.yaml`:
 
 - `extrinsic/translation/x y z`
 - `extrinsic/rotation/roll pitch yaw`
-- `extrinsic/rotation/unit`: `rad` 或 `deg`
+- `extrinsic/rotation/unit`: `rad` or `deg`
 
-当前代码约定 YAML 填的是 `T_body_lidar`：
+Current code expects `T_body_lidar` in YAML:
 
-- `translation` 表示雷达原点在机体系中的位置
-- `rotation` 表示雷达坐标系相对机体系的姿态
+- `translation` is the lidar origin in body frame
+- `rotation` is the lidar frame pose relative to body frame
 
-## 启动
+## Launch
 
 ```bash
 roslaunch odom_to_mavros odom_to_mavros.launch
 ```
 
-## 示例
-
-如果 FAST-LIO 输出话题不是 `/Odometry`，就在 launch 里改：
-
-```xml
-<param name="input_topic" value="/fastlio_odom" />
-```
-
-如果你的外参是角度制，直接在 YAML 里写：
+## Example config
 
 ```yaml
 extrinsic:
@@ -63,8 +55,8 @@ extrinsic:
     yaw: 5.0
 ```
 
-## 注意
+## Notes
 
-- 这个节点只负责转发和坐标变换，不负责 TF 发布。
-- `frame_id` 只是消息标签，不会自动做坐标变换。
-- 如果外参方向填反，输出位姿会整体偏掉。
+- This node only republishes odometry and applies frame transforms
+- `frame_id` is a message label only; it does not create TF or trigger transforms
+- If the extrinsic direction is wrong, the output pose will be rotated or shifted
