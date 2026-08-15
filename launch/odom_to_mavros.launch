@@ -3,5 +3,6 @@
         <param name="input_topic" value="/Odometry" />
         <param name="output_topic" value="/mavros/vision_pose/pose" />
         <param name="frame_id" value="world" />
+        <rosparam command="load" file="$(find odom_to_mavros)/config/odom_to_mavros.yaml" />
     </node>
 </launch>

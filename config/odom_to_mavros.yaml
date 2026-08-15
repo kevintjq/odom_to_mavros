@@ -1,0 +1,14 @@
+extrinsic:
+  # T_body_lidar:
+  # - translation is the lidar origin in body frame
+  # - rotation is the lidar frame pose relative to body frame
+  translation:
+    x: 0.0
+    y: 0.0
+    z: 0.0
+  rotation:
+    # unit can be: rad, deg
+    unit: deg
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
