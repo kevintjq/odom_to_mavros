@@ -63,24 +63,93 @@ extrinsic:
 
 ## 如何用 LiDAR_IMU_Init 获取 xyz
 
-如果你的目标只是拿到雷达传感器和飞控之间的相对位置偏移，可以用 `LiDAR_IMU_Init` 先标定出 LiDAR 和飞控 IMU 的外参，再把平移部分填到本节点的 YAML 里。
-
-建议流程：
-
-1. 让 `lid_topic` 指向 Mid360 的点云话题
-2. 让 `imu_topic` 指向飞控 IMU 话题，而不是 Mid360 自带 IMU
-3. 录一段包含静止和明显转动/平移激励的 bag
-4. 跑 `LiDAR_IMU_Init`
-5. 从结果文件里读取平移向量 `x y z`
-
-常见注意点：
-
-- 如果标定结果里写的是 `T_body_lidar` 或 “lidar in body frame”，通常可以直接拿来填 `translation`
-- 如果结果写成了反方向，比如 `T_lidar_body`，需要先取逆再填
-- 如果你已经确认两套坐标轴完全对齐，`rotation` 可以先设为 `0, 0, 0`
-
-对这个节点来说，最终要填的是机体系下的雷达原点位置，也就是：
+`LiDAR_IMU_Init` 的结果文件里通常会打印两行最关键的信息：
 
 ```text
-translation = [x, y, z]
+Rotation LiDAR to IMU (degree) = roll pitch yaw
+Translation LiDAR to IMU (meter) = x y z
 ```
+
+如果你的“body”就是飞控 IMU 这个坐标系，那么这组结果**可以直接填进本节点**：
+
+```yaml
+extrinsic:
+  translation:
+    x: x
+    y: y
+    z: z
+  rotation:
+    unit: deg
+    roll: roll
+    pitch: pitch
+    yaw: yaw
+```
+
+也就是说，你要的 `xyz` 就是 `Translation LiDAR to IMU` 这一行里的三个数。
+
+如果你现在只想先填平移量，那就直接抄 `translation`，`rotation` 可以先置零。
+
+### 读取步骤
+
+1. 用 `LiDAR_IMU_Init` 跑完标定
+2. 打开 `result/Initialization_result.txt`
+3. 找最后一组 `Translation LiDAR to IMU`
+4. 把三个数按 `x / y / z` 填到 `extrinsic.translation`
+
+### 方向怎么换
+
+如果你拿到的是 `T_imu_lidar`，而你要的是反方向 `T_lidar_imu`，用下面这个逆变换：
+
+```text
+R_inv = R^T
+t_inv = -R^T * t
+```
+
+其中：
+
+- `R` 是 3x3 旋转矩阵
+- `t` 是平移向量 `[x, y, z]`
+
+### 脚本方式
+
+本仓库额外提供了一个小脚本，可以把 `Initialization_result.txt` 直接转成 YAML 片段：
+
+先打开脚本，修改文件开头的配置：
+
+```python
+RESULT_FILE = r"C:\path\to\LiDAR_IMU_Init\result\Initialization_result.txt"
+OUTPUT_INVERSE = False
+OUTPUT_UNIT = "deg"
+OUTPUT_FORMAT = "yaml"
+```
+
+然后运行：
+
+```bash
+python tools/convert_lidar_imu_init.py
+```
+
+脚本默认读取结果文件里最后一组 `Rotation LiDAR to IMU` 和 `Translation LiDAR to IMU`。
+
+默认输出 YAML。比如：
+
+```text
+extrinsic:
+  translation:
+    x: 0.123456
+    y: -0.234567
+    z: 0.345678
+  rotation:
+    unit: deg
+    roll: 0.000000
+    pitch: 0.000000
+    yaw: 1.234567
+```
+
+如果你想输出反方向，直接加 `--inverse`：
+
+```bash
+python tools/convert_lidar_imu_init.py --inverse
+```
+
+也可以直接把脚本顶部的 `OUTPUT_INVERSE` 改成 `True`。
