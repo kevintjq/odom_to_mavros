@@ -60,3 +60,27 @@ extrinsic:
 - 这个节点只做里程计转发和坐标变换，不负责 TF 发布
 - `frame_id` 只是消息标签，不会触发自动坐标变换
 - 如果外参方向填反，输出位姿会整体偏移或旋转
+
+## 如何用 LiDAR_IMU_Init 获取 xyz
+
+如果你的目标只是拿到雷达传感器和飞控之间的相对位置偏移，可以用 `LiDAR_IMU_Init` 先标定出 LiDAR 和飞控 IMU 的外参，再把平移部分填到本节点的 YAML 里。
+
+建议流程：
+
+1. 让 `lid_topic` 指向 Mid360 的点云话题
+2. 让 `imu_topic` 指向飞控 IMU 话题，而不是 Mid360 自带 IMU
+3. 录一段包含静止和明显转动/平移激励的 bag
+4. 跑 `LiDAR_IMU_Init`
+5. 从结果文件里读取平移向量 `x y z`
+
+常见注意点：
+
+- 如果标定结果里写的是 `T_body_lidar` 或 “lidar in body frame”，通常可以直接拿来填 `translation`
+- 如果结果写成了反方向，比如 `T_lidar_body`，需要先取逆再填
+- 如果你已经确认两套坐标轴完全对齐，`rotation` 可以先设为 `0, 0, 0`
+
+对这个节点来说，最终要填的是机体系下的雷达原点位置，也就是：
+
+```text
+translation = [x, y, z]
+```
