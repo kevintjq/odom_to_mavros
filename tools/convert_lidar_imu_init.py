@@ -30,7 +30,7 @@ from typing import Tuple
 
 # ===== User config =====
 # Path to LiDAR_IMU_Init/result/Initialization_result.txt
-RESULT_FILE = r"C:\path\to\LiDAR_IMU_Init\result\Initialization_result.txt"
+RESULT_FILE = "/path/to/LiDAR_IMU_Init/result/Initialization_result.txt"
 
 # False: output LiDAR->IMU, usually what this project wants.
 # True: output IMU->LiDAR.
@@ -41,6 +41,10 @@ OUTPUT_UNIT = "deg"
 
 # Output format: "yaml" or "text".
 OUTPUT_FORMAT = "yaml"
+
+# Write the converted result to a .txt file beside this script.
+WRITE_OUTPUT_FILE = True
+OUTPUT_FILE_NAME = "odom_to_mavros_extrinsic.txt"
 # =======================
 
 
@@ -163,31 +167,37 @@ def format_value(value: float, unit: str) -> float:
     return value
 
 
-def print_yaml(ex: Extrinsic, unit: str) -> None:
-    print("extrinsic:")
-    print("  translation:")
-    print(f"    x: {ex.x:.6f}")
-    print(f"    y: {ex.y:.6f}")
-    print(f"    z: {ex.z:.6f}")
-    print("  rotation:")
-    print(f"    unit: {unit}")
-    print(f"    roll: {format_value(ex.roll, unit):.6f}")
-    print(f"    pitch: {format_value(ex.pitch, unit):.6f}")
-    print(f"    yaw: {format_value(ex.yaw, unit):.6f}")
+def render_output(ex: Extrinsic, fmt: str, unit: str) -> str:
+    lines: list[str] = []
 
+    def capture_print(*args: object) -> None:
+        lines.append(" ".join(str(arg) for arg in args))
 
-def print_text(ex: Extrinsic, unit: str) -> None:
-    print(f"translation: [{ex.x:.6f}, {ex.y:.6f}, {ex.z:.6f}]")
-    if unit == "deg":
-        print(
-            "rotation(deg): "
-            f"[{math.degrees(ex.roll):.6f}, {math.degrees(ex.pitch):.6f}, {math.degrees(ex.yaw):.6f}]"
-        )
+    if fmt == "yaml":
+        capture_print("extrinsic:")
+        capture_print("  translation:")
+        capture_print(f"    x: {ex.x:.6f}")
+        capture_print(f"    y: {ex.y:.6f}")
+        capture_print(f"    z: {ex.z:.6f}")
+        capture_print("  rotation:")
+        capture_print(f"    unit: {unit}")
+        capture_print(f"    roll: {format_value(ex.roll, unit):.6f}")
+        capture_print(f"    pitch: {format_value(ex.pitch, unit):.6f}")
+        capture_print(f"    yaw: {format_value(ex.yaw, unit):.6f}")
     else:
-        print(
-            "rotation(rad): "
-            f"[{ex.roll:.6f}, {ex.pitch:.6f}, {ex.yaw:.6f}]"
-        )
+        capture_print(f"translation: [{ex.x:.6f}, {ex.y:.6f}, {ex.z:.6f}]")
+        if unit == "deg":
+            capture_print(
+                "rotation(deg): "
+                f"[{math.degrees(ex.roll):.6f}, {math.degrees(ex.pitch):.6f}, {math.degrees(ex.yaw):.6f}]"
+            )
+        else:
+            capture_print(
+                "rotation(rad): "
+                f"[{ex.roll:.6f}, {ex.pitch:.6f}, {ex.yaw:.6f}]"
+            )
+
+    return "\n".join(lines) + "\n"
 
 
 def main() -> int:
@@ -232,10 +242,13 @@ def main() -> int:
     if args.inverse:
         extrinsic = invert_extrinsic(extrinsic)
 
-    if args.format == "yaml":
-        print_yaml(extrinsic, args.unit)
-    else:
-        print_text(extrinsic, args.unit)
+    output_text = render_output(extrinsic, args.format, args.unit)
+    print(output_text, end="")
+
+    if WRITE_OUTPUT_FILE:
+        output_file = Path(__file__).resolve().parent / OUTPUT_FILE_NAME
+        output_file.write_text(output_text, encoding="utf-8")
+        print(f"\nSaved to: {output_file}")
     return 0
 
 

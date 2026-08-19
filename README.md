@@ -117,7 +117,7 @@ t_inv = -R^T * t
 先打开脚本，修改文件开头的配置：
 
 ```python
-RESULT_FILE = r"C:\path\to\LiDAR_IMU_Init\result\Initialization_result.txt"
+RESULT_FILE = "/path/to/LiDAR_IMU_Init/result/Initialization_result.txt"
 OUTPUT_INVERSE = False
 OUTPUT_UNIT = "deg"
 OUTPUT_FORMAT = "yaml"
@@ -130,6 +130,7 @@ python tools/convert_lidar_imu_init.py
 ```
 
 脚本默认读取结果文件里最后一组 `Rotation LiDAR to IMU` 和 `Translation LiDAR to IMU`。
+同时会在脚本同目录下写出一个 `odom_to_mavros_extrinsic.txt`。
 
 默认输出 YAML。比如：
 
