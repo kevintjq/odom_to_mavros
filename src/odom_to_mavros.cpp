@@ -228,7 +228,7 @@ private:
 
   void triggerAutoLand(const std::string& reason)
   {
-    if (!enable_auto_land_on_drift || auto_land_triggered_)
+    if (!enable_auto_land_on_drift_ || auto_land_triggered_)
     {
       return;
     }
@@ -342,7 +342,7 @@ private:
     addDiagnosticValue(status, "invalid_drop_count", dropped_invalid_count_);
     addDiagnosticValue(status, "timestamp_drop_count", dropped_timestamp_count_);
     addDiagnosticValue(status, "drift_check_drop_count", dropped_drift_count_);
-    addDiagnosticValue(status, "auto_land_enabled", enable_auto_land_on_drift ? "true" : "false");
+    addDiagnosticValue(status, "auto_land_enabled", enable_auto_land_on_drift_ ? "true" : "false");
     addDiagnosticValue(status, "auto_land_triggered", auto_land_triggered_ ? "true" : "false");
     addDiagnosticValue(status, "auto_land_result", auto_land_result_);
     addDiagnosticValue(status, "frequency_hz", frequency);
