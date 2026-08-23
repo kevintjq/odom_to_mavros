@@ -21,6 +21,60 @@
 - `output_topic`：输出视觉位姿话题，默认 `/mavros/vision_pose/pose`
 - `frame_id`：消息头里的坐标系名，默认 `world`
 
+### 简化监控参数
+
+只需要在 `config/odom_to_mavros.yaml` 中配置两个值：
+
+- `max_flight_speed`：无人机最大正常飞行速度，单位为 `m/s`。建议填实际最大速度，不要填理论极限。
+- `max_angular_speed`：无人机最大正常角速度，单位为 `rad/s`。
+
+输入频率不需要配置，程序会根据里程计消息的实际到达时间自动估计，适用于 FAST-LIO、其他 LIO 或任何 `nav_msgs/Odometry` 发布器。频率估计完成后会在终端打印自动生成的阈值。
+
+程序会自动计算其余阈值：
+
+```text
+max_linear_speed  = max_flight_speed * 2
+max_position_jump = max_linear_speed / learned_input_frequency * 2
+min_input_frequency = learned_input_frequency * 0.5
+max_message_age = max(3 / learned_input_frequency, 0.2)
+```
+
+例如无人机最大正常速度为 `5 m/s`，程序自动测得输入频率为 `10 Hz`：
+
+```yaml
+max_flight_speed: 5.0
+max_angular_speed: 10.0
+```
+
+程序自动得到：最大允许线速度 `10 m/s`、单帧最大跳变 `2 m`、最低输入频率 `5 Hz`、最大消息延迟 `0.3 s`。
+
+协方差阈值、未来时间容差和诊断周期使用代码内固定值。检测到非法数据、定位质量恶化、位姿跳变、速度异常或输入过期时，消息会被丢弃，并通过终端 warning 和 `/diagnostics` 报告。该检测可以发现数据跳变或定位质量恶化，但不能单独证明缓慢的绝对漂移。
+
+### LIO 失效判断与停止发送
+
+程序通过输入消息、时间戳、位姿数值、协方差和运动连续性判断 LIO 输出是否异常。检测到异常时，只会停止发送当前异常消息，不会主动切换 PX4 飞行模式、降落或执行其他飞控控制。
+
+以下情况会丢弃消息，不发布到 `/mavros/vision_pose/pose`：
+
+- LIO 停止发布消息，或者输入长时间没有更新。诊断状态会变为 `Odometry input is stale`。
+- 时间戳为零、倒序、没有递增、过旧，或超前当前 ROS 时间过多。
+- 位置或四元数包含 `NaN`、`Inf`，或者四元数接近零。
+- 协方差无效，或位置/姿态协方差超过程序内置阈值。
+- 相邻位姿位置跳变过大。
+- 根据相邻位姿计算出的线速度超过自动计算的允许值。
+- 根据相邻姿态计算出的角速度超过 `max_angular_speed`。
+- 外参变换后的位姿包含非法数值。
+
+程序启动后会根据里程计消息的实际到达时间自动估计输入频率。频率估计完成后，自动生成最低输入频率、最大消息延迟和单帧最大位置跳变阈值。输入频率过低会产生诊断告警；如果消息仍在到达，频率过低本身不会单独丢弃消息。
+
+当前程序无法仅凭 LIO 里程计判断以下情况：
+
+- 位姿数值连续但已经发生缓慢的绝对漂移。
+- 位姿冻结但时间戳仍持续更新。
+- 坐标系方向配置错误但数值看起来正常。
+
+判断绝对漂移需要 GPS/RTK、动捕、UWB 或其他外部定位参考。诊断信息发布在 `/diagnostics`，可以查看输入频率、消息延迟、发布数量和各类丢弃计数。LIO 失效后，bridge 不会发送最后一帧旧位姿，最终是否触发 PX4 failsafe 由 PX4 的 EKF 和 failsafe 参数决定。
+
 ### 外参配置
 
 外参由 `config/odom_to_mavros.yaml` 加载：
@@ -29,10 +83,10 @@
 - `extrinsic/rotation/roll pitch yaw`
 - `extrinsic/rotation/unit`：`rad` 或 `deg`
 
-当前代码约定 YAML 中填写的是 `T_fcu_fastlio_body`：
+当前代码约定 YAML 中填写的是 `T_fcu_lio_body`：
 
-- `translation` 表示 FAST-LIO body 原点在飞控 FCU body 系下的位置
-- `rotation` 表示 FAST-LIO body 坐标系相对飞控 FCU body 系的姿态
+- `translation` 表示 LIO body 原点在飞控 FCU body 系下的位置
+- `rotation` 表示 LIO body 坐标系相对飞控 FCU body 系的姿态
 
 ## 启动
 

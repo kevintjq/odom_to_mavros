@@ -9,28 +9,26 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include <algorithm>
 #include <string>
 
-class FastlioToMavros
+class LioToMavros
 {
 public:
-  FastlioToMavros(ros::NodeHandle& nh, ros::NodeHandle& pnh)
+  LioToMavros(ros::NodeHandle& nh, ros::NodeHandle& pnh)
   {
     pnh.param<std::string>("input_topic", input_topic_, "/Odometry");
     pnh.param<std::string>("output_topic", output_topic_, "/mavros/vision_pose/pose");
     pnh.param<std::string>("frame_id", frame_id_, "world");
-    pnh.param<double>("max_message_age", max_message_age_, 0.5);
-    pnh.param<double>("max_future_offset", max_future_offset_, 0.1);
-    pnh.param<double>("min_input_frequency", min_input_frequency_, 5.0);
-    pnh.param<double>("diagnostic_period", diagnostic_period_, 1.0);
+    pnh.param<double>("max_flight_speed", max_flight_speed_, 5.0);
+    pnh.param<double>("max_angular_speed", max_angular_speed_, 10.0);
 
-    if (max_message_age_ <= 0.0 || max_future_offset_ < 0.0 ||
-        min_input_frequency_ < 0.0 || diagnostic_period_ <= 0.0)
+    if (!std::isfinite(max_flight_speed_) || !std::isfinite(max_angular_speed_) ||
+        max_flight_speed_ <= 0.0 || max_angular_speed_ <= 0.0)
     {
-      ROS_FATAL("Invalid monitoring parameters: max_message_age=%.3f, "
-                "max_future_offset=%.3f, min_input_frequency=%.3f, "
-                "diagnostic_period=%.3f",
-                max_message_age_, max_future_offset_, min_input_frequency_, diagnostic_period_);
+      ROS_FATAL("Invalid monitoring parameters: max_flight_speed=%.3f, "
+                "max_angular_speed=%.3f",
+                max_flight_speed_, max_angular_speed_);
       ros::shutdown();
       return;
     }
@@ -39,9 +37,9 @@ public:
 
     vision_pub_ = nh.advertise<geometry_msgs::PoseStamped>(output_topic_, 10);
     diagnostics_pub_ = nh.advertise<diagnostic_msgs::DiagnosticArray>("/diagnostics", 1);
-    odom_sub_ = nh.subscribe(input_topic_, 100, &FastlioToMavros::odomCallback, this);
+    odom_sub_ = nh.subscribe(input_topic_, 100, &LioToMavros::odomCallback, this);
     diagnostics_timer_ = nh.createTimer(ros::Duration(diagnostic_period_),
-                                        &FastlioToMavros::diagnosticsCallback, this);
+                                        &LioToMavros::diagnosticsCallback, this);
 
     ROS_INFO("Subscribed to LIO odometry: %s", input_topic_.c_str());
     ROS_INFO("Publishing vision pose to: %s", output_topic_.c_str());
@@ -59,6 +57,7 @@ private:
       receive_times_.pop_front();
     }
     last_receive_wall_ = receive_time;
+    updateFrequencyEstimate();
 
     const ros::Time now = ros::Time::now();
     if (msg->header.stamp.isZero())
@@ -110,26 +109,49 @@ private:
       return;
     }
 
-    Eigen::Quaterniond q_world_fastlio_body(msg->pose.pose.orientation.w,
+    const double position_variance = std::max(
+        msg->pose.covariance[0],
+        std::max(msg->pose.covariance[7], msg->pose.covariance[14]));
+    const double orientation_variance = std::max(
+        msg->pose.covariance[21],
+        std::max(msg->pose.covariance[28], msg->pose.covariance[35]));
+    const bool covariance_is_valid =
+        std::isfinite(msg->pose.covariance[0]) &&
+        std::isfinite(msg->pose.covariance[7]) &&
+        std::isfinite(msg->pose.covariance[14]) &&
+        std::isfinite(msg->pose.covariance[21]) &&
+        std::isfinite(msg->pose.covariance[28]) &&
+        std::isfinite(msg->pose.covariance[35]) &&
+        position_variance >= 0.0 && orientation_variance >= 0.0;
+    if (!covariance_is_valid ||
+        (max_position_variance_ > 0.0 && position_variance > max_position_variance_) ||
+        (max_orientation_variance_ > 0.0 && orientation_variance > max_orientation_variance_))
+    {
+      ++dropped_drift_count_;
+      ROS_WARN_THROTTLE(1.0, "Odometry covariance indicates poor localization, skip this message.");
+      return;
+    }
+
+    Eigen::Quaterniond q_world_lio_body(msg->pose.pose.orientation.w,
                                             msg->pose.pose.orientation.x,
                                             msg->pose.pose.orientation.y,
                                             msg->pose.pose.orientation.z);
-    if (!std::isfinite(q_world_fastlio_body.norm()) || q_world_fastlio_body.norm() < 1e-6)
+    if (!std::isfinite(q_world_lio_body.norm()) || q_world_lio_body.norm() < 1e-6)
     {
       ++dropped_invalid_count_;
       ROS_WARN_THROTTLE(1.0, "Received invalid odometry quaternion, skip this message.");
       return;
     }
-    q_world_fastlio_body.normalize();
+    q_world_lio_body.normalize();
 
-    Eigen::Isometry3d t_world_fastlio_body = Eigen::Isometry3d::Identity();
-    t_world_fastlio_body.linear() = q_world_fastlio_body.toRotationMatrix();
-    t_world_fastlio_body.translation() = Eigen::Vector3d(msg->pose.pose.position.x,
+    Eigen::Isometry3d t_world_lio_body = Eigen::Isometry3d::Identity();
+    t_world_lio_body.linear() = q_world_lio_body.toRotationMatrix();
+    t_world_lio_body.translation() = Eigen::Vector3d(msg->pose.pose.position.x,
                                                          msg->pose.pose.position.y,
                                                          msg->pose.pose.position.z);
 
     const Eigen::Isometry3d t_world_fcu =
-        t_world_fastlio_body * t_fcu_fastlio_body_.inverse();
+        t_world_lio_body * t_fcu_lio_body_.inverse();
     Eigen::Quaterniond q_world_fcu(t_world_fcu.rotation());
     q_world_fcu.normalize();
 
@@ -144,9 +166,43 @@ private:
       return;
     }
 
+    if (last_pose_valid_)
+    {
+      const double dt = (msg->header.stamp - last_pose_stamp_).toSec();
+      if (dt <= 0.0)
+      {
+        ++dropped_timestamp_count_;
+        ROS_WARN_THROTTLE(1.0, "Odometry timestamp did not advance, skip this message.");
+        return;
+      }
+
+      const Eigen::Vector3d position_delta =
+          t_world_fcu.translation() - last_position_;
+      const double position_jump = position_delta.norm();
+      const double linear_speed = position_jump / dt;
+      const Eigen::Quaterniond delta_orientation = last_orientation_.inverse() * q_world_fcu;
+      const double angle = Eigen::AngleAxisd(delta_orientation).angle();
+      const double angular_speed = angle / dt;
+      if ((max_position_jump_ > 0.0 && position_jump > max_position_jump_) ||
+          (max_linear_speed_ > 0.0 && linear_speed > max_linear_speed_) ||
+          (max_angular_speed_ > 0.0 && angular_speed > max_angular_speed_))
+      {
+        ++dropped_drift_count_;
+        ROS_WARN_THROTTLE(1.0,
+                          "Odometry motion is implausible (jump=%.3f m, speed=%.3f m/s, "
+                          "angular_speed=%.3f rad/s), skip this message.",
+                          position_jump, linear_speed, angular_speed);
+        return;
+      }
+    }
+
     // Only advance the timestamp watermark after the complete pose is valid.
     last_stamp_ = msg->header.stamp;
     last_stamp_valid_ = true;
+    last_pose_stamp_ = msg->header.stamp;
+    last_position_ = t_world_fcu.translation();
+    last_orientation_ = q_world_fcu;
+    last_pose_valid_ = true;
 
     geometry_msgs::PoseStamped vision_pose;
     vision_pose.header.stamp = msg->header.stamp;
@@ -163,6 +219,39 @@ private:
 
     vision_pub_.publish(vision_pose);
     ++published_count_;
+  }
+
+  void updateFrequencyEstimate()
+  {
+    if (frequency_learned_ || receive_times_.size() < 2)
+    {
+      return;
+    }
+
+    const double window = (receive_times_.back() - receive_times_.front()).toSec();
+    if (window < frequency_learning_window_)
+    {
+      return;
+    }
+
+    nominal_input_frequency_ =
+        static_cast<double>(receive_times_.size() - 1) / window;
+    if (nominal_input_frequency_ <= 0.0 || !std::isfinite(nominal_input_frequency_))
+    {
+      return;
+    }
+
+    min_input_frequency_ = nominal_input_frequency_ * 0.5;
+    max_message_age_ = std::max(0.2, 3.0 / nominal_input_frequency_);
+    max_linear_speed_ = max_flight_speed_ * 2.0;
+    max_position_jump_ = max_linear_speed_ / nominal_input_frequency_ * 2.0;
+    frequency_learned_ = true;
+
+    ROS_INFO("Learned input frequency: %.3f Hz; derived thresholds: "
+             "max_message_age=%.3f s, min_input_frequency=%.3f Hz, "
+             "max_position_jump=%.3f m",
+             nominal_input_frequency_, max_message_age_, min_input_frequency_,
+             max_position_jump_);
   }
 
   void diagnosticsCallback(const ros::TimerEvent&)
@@ -196,10 +285,15 @@ private:
       status.level = diagnostic_msgs::DiagnosticStatus::ERROR;
       status.message = "Odometry input is stale";
     }
-    else if (receive_times_.size() >= 2 && frequency < min_input_frequency_)
+    else if (frequency_learned_ && frequency < min_input_frequency_)
     {
       status.level = diagnostic_msgs::DiagnosticStatus::WARN;
       status.message = "Odometry input frequency is low";
+    }
+    else if (dropped_drift_count_ > 0)
+    {
+      status.level = diagnostic_msgs::DiagnosticStatus::WARN;
+      status.message = "Odometry quality or motion check rejected messages";
     }
     else if (dropped_invalid_count_ > 0 || dropped_timestamp_count_ > 0)
     {
@@ -212,7 +306,9 @@ private:
     addDiagnosticValue(status, "published_count", published_count_);
     addDiagnosticValue(status, "invalid_drop_count", dropped_invalid_count_);
     addDiagnosticValue(status, "timestamp_drop_count", dropped_timestamp_count_);
+    addDiagnosticValue(status, "drift_check_drop_count", dropped_drift_count_);
     addDiagnosticValue(status, "frequency_hz", frequency);
+    addDiagnosticValue(status, "nominal_frequency_hz", nominal_input_frequency_);
     addDiagnosticValue(status, "last_receive_age_sec", receive_age);
     addDiagnosticValue(status, "last_message_delay_sec", last_delay_sec_);
     array.status.push_back(status);
@@ -273,13 +369,13 @@ private:
     const Eigen::AngleAxisd roll_angle(roll, Eigen::Vector3d::UnitX());
     const Eigen::AngleAxisd pitch_angle(pitch, Eigen::Vector3d::UnitY());
     const Eigen::AngleAxisd yaw_angle(yaw, Eigen::Vector3d::UnitZ());
-    const Eigen::Quaterniond q_fcu_fastlio_body = yaw_angle * pitch_angle * roll_angle;
+    const Eigen::Quaterniond q_fcu_lio_body = yaw_angle * pitch_angle * roll_angle;
 
-    t_fcu_fastlio_body_ = Eigen::Isometry3d::Identity();
-    t_fcu_fastlio_body_.linear() = q_fcu_fastlio_body.toRotationMatrix();
-    t_fcu_fastlio_body_.translation() = Eigen::Vector3d(x, y, z);
+    t_fcu_lio_body_ = Eigen::Isometry3d::Identity();
+    t_fcu_lio_body_.linear() = q_fcu_lio_body.toRotationMatrix();
+    t_fcu_lio_body_.translation() = Eigen::Vector3d(x, y, z);
 
-    ROS_INFO("Loaded T_fcu_fastlio_body: xyz = [%.4f, %.4f, %.4f], "
+    ROS_INFO("Loaded T_fcu_lio_body: xyz = [%.4f, %.4f, %.4f], "
              "rpy(rad) = [%.4f, %.4f, %.4f]",
              x, y, z, roll, pitch, yaw);
   }
@@ -288,24 +384,39 @@ private:
   ros::Publisher vision_pub_;
   ros::Publisher diagnostics_pub_;
   ros::Timer diagnostics_timer_;
-  Eigen::Isometry3d t_fcu_fastlio_body_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d t_fcu_lio_body_ = Eigen::Isometry3d::Identity();
   std::string input_topic_;
   std::string output_topic_;
   std::string frame_id_;
-  double max_message_age_ = 0.5;
+  double max_flight_speed_ = 5.0;
+  // Temporary startup allowance; replaced after the input frequency is learned.
+  double max_message_age_ = 5.0;
   double max_future_offset_ = 0.1;
   double min_input_frequency_ = 5.0;
   double diagnostic_period_ = 1.0;
+  double max_position_variance_ = 4.0;
+  double max_orientation_variance_ = 1.0;
+  double max_position_jump_ = 2.0;
+  double max_linear_speed_ = 10.0;
+  double max_angular_speed_ = 10.0;
   const double frequency_window_ = 2.0;
+  const double frequency_learning_window_ = 1.0;
   ros::WallTime last_receive_wall_;
   std::deque<ros::WallTime> receive_times_;
+  double nominal_input_frequency_ = 0.0;
+  bool frequency_learned_ = false;
   ros::Time last_stamp_;
   bool last_stamp_valid_ = false;
+  ros::Time last_pose_stamp_;
+  bool last_pose_valid_ = false;
+  Eigen::Vector3d last_position_ = Eigen::Vector3d::Zero();
+  Eigen::Quaterniond last_orientation_ = Eigen::Quaterniond::Identity();
   double last_delay_sec_ = 0.0;
   uint64_t received_count_ = 0;
   uint64_t published_count_ = 0;
   uint64_t dropped_invalid_count_ = 0;
   uint64_t dropped_timestamp_count_ = 0;
+  uint64_t dropped_drift_count_ = 0;
 };
 
 int main(int argc, char** argv)
@@ -314,7 +425,7 @@ int main(int argc, char** argv)
   ros::NodeHandle nh;
   ros::NodeHandle pnh("~");
 
-  FastlioToMavros node(nh, pnh);
+  LioToMavros node(nh, pnh);
   ros::spin();
   return 0;
 }

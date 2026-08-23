@@ -1,21 +1,20 @@
 extrinsic:
-  # T_fcu_fastlio_body:
-  # - translation is the FAST-LIO body origin in FCU body frame
-  # - rotation is the FAST-LIO body frame pose relative to FCU body frame
+  # T_fcu_lio_body：LIO body 坐标系到飞控 FCU body 坐标系的外参。
+  # translation：LIO body 原点在 FCU body 坐标系中的位置，单位为米。
+  # rotation：LIO body 坐标系相对于 FCU body 坐标系的姿态。
   translation:
     x: 0.0
     y: 0.0
     z: 0.0
   rotation:
-    # unit can be: rad, deg
+    # 角度单位，可选 rad（弧度）或 deg（角度）。
     unit: deg
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
 
-# Input monitoring.
-# Messages older than max_message_age or too far in the future are rejected.
-max_message_age: 0.5
-max_future_offset: 0.1
-min_input_frequency: 5.0
-diagnostic_period: 1.0
+# 只需要配置下面两个监控参数，单位分别为 m/s 和 rad/s。
+# max_flight_speed：无人机最大正常飞行速度，不要填理论极限速度。
+max_flight_speed: 5.0
+# max_angular_speed：无人机最大正常角速度，单位为 rad/s。
+max_angular_speed: 10.0

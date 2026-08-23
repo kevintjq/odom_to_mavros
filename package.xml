@@ -2,7 +2,7 @@
 <package format="2">
   <name>odom_to_mavros</name>
   <version>0.0.0</version>
-  <description>Subscribe FAST-LIO odometry and forward position to MAVROS vision pose</description>
+  <description>Subscribe LIO odometry and forward position to MAVROS vision pose</description>
 
   <!-- One maintainer tag required, multiple allowed, one person per tag -->
   <!-- Example:  -->
