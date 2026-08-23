@@ -27,6 +27,7 @@
 
 - `max_flight_speed`：无人机最大正常飞行速度，单位为 `m/s`。建议填实际最大速度，不要填理论极限。
 - `max_angular_speed`：无人机最大正常角速度，单位为 `rad/s`。
+- `enable_auto_land_on_drift`：是否在检测到 LIO 漂移/异常时通过 `/mavros/set_mode` 请求 `AUTO.LAND`，默认 `false`。
 
 输入频率不需要配置，程序会根据里程计消息的实际到达时间自动估计，适用于 FAST-LIO、其他 LIO 或任何 `nav_msgs/Odometry` 发布器。频率估计完成后会在终端打印自动生成的阈值。
 
@@ -74,6 +75,8 @@ max_angular_speed: 10.0
 - 坐标系方向配置错误但数值看起来正常。
 
 判断绝对漂移需要 GPS/RTK、动捕、UWB 或其他外部定位参考。诊断信息发布在 `/diagnostics`，可以查看输入频率、消息延迟、发布数量和各类丢弃计数。LIO 失效后，bridge 不会发送最后一帧旧位姿，最终是否触发 PX4 failsafe 由 PX4 的 EKF 和 failsafe 参数决定。
+
+当 `enable_auto_land_on_drift: true` 时，程序在检测到协方差恶化、位置跳变、线速度异常或角速度异常后，会停止发送异常位姿，并通过 `/mavros/set_mode` 请求 `AUTO.LAND`。同一次 bridge 运行期间只请求一次；请求结果会写入终端和 `/diagnostics`。该功能只在检测到位姿质量或运动异常时触发，LIO 单纯断流不会由本节点自动请求降落。开启前必须确认飞控处于允许切换模式的状态，并在仿真环境中验证。
 
 ### 外参配置
 

@@ -1,5 +1,6 @@
 #include <Eigen/Geometry>
 #include <geometry_msgs/PoseStamped.h>
+#include <mavros_msgs/SetMode.h>
 #include <nav_msgs/Odometry.h>
 #include <diagnostic_msgs/DiagnosticArray.h>
 #include <diagnostic_msgs/DiagnosticStatus.h>
@@ -22,6 +23,7 @@ public:
     pnh.param<std::string>("frame_id", frame_id_, "world");
     pnh.param<double>("max_flight_speed", max_flight_speed_, 5.0);
     pnh.param<double>("max_angular_speed", max_angular_speed_, 10.0);
+    pnh.param<bool>("enable_auto_land_on_drift", enable_auto_land_on_drift_, false);
 
     if (!std::isfinite(max_flight_speed_) || !std::isfinite(max_angular_speed_) ||
         max_flight_speed_ <= 0.0 || max_angular_speed_ <= 0.0)
@@ -37,6 +39,7 @@ public:
 
     vision_pub_ = nh.advertise<geometry_msgs::PoseStamped>(output_topic_, 10);
     diagnostics_pub_ = nh.advertise<diagnostic_msgs::DiagnosticArray>("/diagnostics", 1);
+    set_mode_client_ = nh.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
     odom_sub_ = nh.subscribe(input_topic_, 100, &LioToMavros::odomCallback, this);
     diagnostics_timer_ = nh.createTimer(ros::Duration(diagnostic_period_),
                                         &LioToMavros::diagnosticsCallback, this);
@@ -128,6 +131,7 @@ private:
         (max_orientation_variance_ > 0.0 && orientation_variance > max_orientation_variance_))
     {
       ++dropped_drift_count_;
+      triggerAutoLand("odometry covariance indicates poor localization");
       ROS_WARN_THROTTLE(1.0, "Odometry covariance indicates poor localization, skip this message.");
       return;
     }
@@ -188,6 +192,7 @@ private:
           (max_angular_speed_ > 0.0 && angular_speed > max_angular_speed_))
       {
         ++dropped_drift_count_;
+        triggerAutoLand("odometry motion is implausible");
         ROS_WARN_THROTTLE(1.0,
                           "Odometry motion is implausible (jump=%.3f m, speed=%.3f m/s, "
                           "angular_speed=%.3f rad/s), skip this message.",
@@ -219,6 +224,36 @@ private:
 
     vision_pub_.publish(vision_pose);
     ++published_count_;
+  }
+
+  void triggerAutoLand(const std::string& reason)
+  {
+    if (!enable_auto_land_on_drift || auto_land_triggered_)
+    {
+      return;
+    }
+
+    mavros_msgs::SetMode set_mode;
+    set_mode.request.base_mode = 0;
+    set_mode.request.custom_mode = "AUTO.LAND";
+    auto_land_triggered_ = true;
+
+    if (!set_mode_client_.call(set_mode))
+    {
+      auto_land_result_ = "service call failed: " + reason;
+      ROS_ERROR("Auto-land request failed (%s): MAVROS set_mode service call failed.", reason.c_str());
+      return;
+    }
+
+    if (!set_mode.response.mode_sent)
+    {
+      auto_land_result_ = "mode was not sent: " + reason;
+      ROS_ERROR("Auto-land request rejected (%s): mode_sent=false.", reason.c_str());
+      return;
+    }
+
+    auto_land_result_ = "AUTO.LAND requested: " + reason;
+    ROS_ERROR("LIO drift detected (%s). AUTO.LAND requested through MAVROS.", reason.c_str());
   }
 
   void updateFrequencyEstimate()
@@ -307,6 +342,9 @@ private:
     addDiagnosticValue(status, "invalid_drop_count", dropped_invalid_count_);
     addDiagnosticValue(status, "timestamp_drop_count", dropped_timestamp_count_);
     addDiagnosticValue(status, "drift_check_drop_count", dropped_drift_count_);
+    addDiagnosticValue(status, "auto_land_enabled", enable_auto_land_on_drift ? "true" : "false");
+    addDiagnosticValue(status, "auto_land_triggered", auto_land_triggered_ ? "true" : "false");
+    addDiagnosticValue(status, "auto_land_result", auto_land_result_);
     addDiagnosticValue(status, "frequency_hz", frequency);
     addDiagnosticValue(status, "nominal_frequency_hz", nominal_input_frequency_);
     addDiagnosticValue(status, "last_receive_age_sec", receive_age);
@@ -384,6 +422,7 @@ private:
   ros::Publisher vision_pub_;
   ros::Publisher diagnostics_pub_;
   ros::Timer diagnostics_timer_;
+  ros::ServiceClient set_mode_client_;
   Eigen::Isometry3d t_fcu_lio_body_ = Eigen::Isometry3d::Identity();
   std::string input_topic_;
   std::string output_topic_;
@@ -399,6 +438,7 @@ private:
   double max_position_jump_ = 2.0;
   double max_linear_speed_ = 10.0;
   double max_angular_speed_ = 10.0;
+  bool enable_auto_land_on_drift_ = false;
   const double frequency_window_ = 2.0;
   const double frequency_learning_window_ = 1.0;
   ros::WallTime last_receive_wall_;
@@ -417,6 +457,8 @@ private:
   uint64_t dropped_invalid_count_ = 0;
   uint64_t dropped_timestamp_count_ = 0;
   uint64_t dropped_drift_count_ = 0;
+  bool auto_land_triggered_ = false;
+  std::string auto_land_result_ = "not requested";
 };
 
 int main(int argc, char** argv)

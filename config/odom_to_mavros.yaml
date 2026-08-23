@@ -18,3 +18,6 @@ extrinsic:
 max_flight_speed: 5.0
 # max_angular_speed：无人机最大正常角速度，单位为 rad/s。
 max_angular_speed: 10.0
+# enable_auto_land_on_drift：检测到 LIO 漂移/异常时是否请求 MAVROS 切换 AUTO.LAND。
+# 默认关闭。开启前请确认 PX4 已正确配置 AUTO.LAND 和相关 failsafe 行为。
+enable_auto_land_on_drift: false
