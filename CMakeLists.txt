@@ -8,6 +8,7 @@ project(odom_to_mavros)
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
+  diagnostic_msgs
   geometry_msgs
   mavros_msgs
   nav_msgs
@@ -106,6 +107,7 @@ find_package(Eigen3 REQUIRED)
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
+  CATKIN_DEPENDS diagnostic_msgs geometry_msgs nav_msgs roscpp
 #  INCLUDE_DIRS include
 #  LIBRARIES odom_to_mavros
 #  CATKIN_DEPENDS geometry_msgs mavros_msgs nav_msgs roscpp std_msgs tf tf2_eigen

@@ -29,10 +29,10 @@
 - `extrinsic/rotation/roll pitch yaw`
 - `extrinsic/rotation/unit`：`rad` 或 `deg`
 
-当前代码约定 YAML 中填写的是 `T_body_lidar`：
+当前代码约定 YAML 中填写的是 `T_fcu_fastlio_body`：
 
-- `translation` 表示雷达原点在机体系下的位置
-- `rotation` 表示雷达坐标系相对机体系的姿态
+- `translation` 表示 FAST-LIO body 原点在飞控 FCU body 系下的位置
+- `rotation` 表示 FAST-LIO body 坐标系相对飞控 FCU body 系的姿态
 
 ## 启动
 

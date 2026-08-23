@@ -1,7 +1,7 @@
 extrinsic:
-  # T_body_lidar:
-  # - translation is the lidar origin in body frame
-  # - rotation is the lidar frame pose relative to body frame
+  # T_fcu_fastlio_body:
+  # - translation is the FAST-LIO body origin in FCU body frame
+  # - rotation is the FAST-LIO body frame pose relative to FCU body frame
   translation:
     x: 0.0
     y: 0.0
@@ -12,3 +12,10 @@ extrinsic:
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
+
+# Input monitoring.
+# Messages older than max_message_age or too far in the future are rejected.
+max_message_age: 0.5
+max_future_offset: 0.1
+min_input_frequency: 5.0
+diagnostic_period: 1.0
