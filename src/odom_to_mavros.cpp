@@ -22,18 +22,22 @@ public:
     pnh.param<std::string>("output_topic", output_topic_, "/mavros/vision_pose/pose");
     pnh.param<std::string>("frame_id", frame_id_, "world");
     pnh.param<double>("max_flight_speed", max_flight_speed_, 5.0);
-    pnh.param<double>("max_angular_speed", max_angular_speed_, 10.0);
-    pnh.param<bool>("enable_auto_land_on_drift", enable_auto_land_on_drift_, false);
+    pnh.param<double>("max_angular_speed", max_angular_speed_deg_, 180.0);
+    pnh.param<double>("vision_pose_timeout", vision_pose_timeout_sec_, 1.0);
+    pnh.param<bool>("enable_vision_pose_timeout_protection",
+                    enable_vision_pose_timeout_protection_, true);
 
-    if (!std::isfinite(max_flight_speed_) || !std::isfinite(max_angular_speed_) ||
-        max_flight_speed_ <= 0.0 || max_angular_speed_ <= 0.0)
+    if (!std::isfinite(max_flight_speed_) || !std::isfinite(max_angular_speed_deg_) ||
+        !std::isfinite(vision_pose_timeout_sec_) || max_flight_speed_ <= 0.0 ||
+        max_angular_speed_deg_ <= 0.0 || vision_pose_timeout_sec_ <= 0.0)
     {
       ROS_FATAL("Invalid monitoring parameters: max_flight_speed=%.3f, "
-                "max_angular_speed=%.3f",
-                max_flight_speed_, max_angular_speed_);
+                "max_angular_speed=%.3f deg/s, vision_pose_timeout=%.3f s",
+                max_flight_speed_, max_angular_speed_deg_, vision_pose_timeout_sec_);
       ros::shutdown();
       return;
     }
+    max_angular_speed_rad_ = max_angular_speed_deg_ * std::acos(-1.0) / 180.0;
 
     loadExtrinsic(pnh);
 
@@ -41,8 +45,8 @@ public:
     diagnostics_pub_ = nh.advertise<diagnostic_msgs::DiagnosticArray>("/diagnostics", 1);
     set_mode_client_ = nh.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
     odom_sub_ = nh.subscribe(input_topic_, 100, &LioToMavros::odomCallback, this);
-    diagnostics_timer_ = nh.createTimer(ros::Duration(diagnostic_period_),
-                                        &LioToMavros::diagnosticsCallback, this);
+    diagnostics_timer_ = nh.createWallTimer(ros::WallDuration(diagnostic_period_),
+                                            &LioToMavros::diagnosticsCallback, this);
 
     ROS_INFO("Subscribed to LIO odometry: %s", input_topic_.c_str());
     ROS_INFO("Publishing vision pose to: %s", output_topic_.c_str());
@@ -131,7 +135,6 @@ private:
         (max_orientation_variance_ > 0.0 && orientation_variance > max_orientation_variance_))
     {
       ++dropped_drift_count_;
-      triggerAutoLand("odometry covariance indicates poor localization");
       ROS_WARN_THROTTLE(1.0, "Odometry covariance indicates poor localization, skip this message.");
       return;
     }
@@ -189,14 +192,13 @@ private:
       const double angular_speed = angle / dt;
       if ((max_position_jump_ > 0.0 && position_jump > max_position_jump_) ||
           (max_linear_speed_ > 0.0 && linear_speed > max_linear_speed_) ||
-          (max_angular_speed_ > 0.0 && angular_speed > max_angular_speed_))
+          (max_angular_speed_rad_ > 0.0 && angular_speed > max_angular_speed_rad_))
       {
         ++dropped_drift_count_;
-        triggerAutoLand("odometry motion is implausible");
         ROS_WARN_THROTTLE(1.0,
                           "Odometry motion is implausible (jump=%.3f m, speed=%.3f m/s, "
-                          "angular_speed=%.3f rad/s), skip this message.",
-                          position_jump, linear_speed, angular_speed);
+                          "angular_speed=%.3f deg/s), skip this message.",
+                          position_jump, linear_speed, angular_speed * 180.0 / std::acos(-1.0));
         return;
       }
     }
@@ -223,37 +225,39 @@ private:
     vision_pose.pose.orientation.w = q_world_fcu.w();
 
     vision_pub_.publish(vision_pose);
+    last_publish_wall_ = ros::WallTime::now();
     ++published_count_;
   }
 
-  void triggerAutoLand(const std::string& reason)
+  void triggerAutoLand()
   {
-    if (!enable_auto_land_on_drift_ || auto_land_triggered_)
+    if (!enable_vision_pose_timeout_protection_ || auto_land_triggered_)
     {
       return;
     }
 
+    auto_land_triggered_ = true;
     mavros_msgs::SetMode set_mode;
     set_mode.request.base_mode = 0;
     set_mode.request.custom_mode = "AUTO.LAND";
-    auto_land_triggered_ = true;
 
     if (!set_mode_client_.call(set_mode))
     {
-      auto_land_result_ = "service call failed: " + reason;
-      ROS_ERROR("Auto-land request failed (%s): MAVROS set_mode service call failed.", reason.c_str());
+      auto_land_result_ = "service call failed";
+      ROS_ERROR("Vision pose output timed out. MAVROS set_mode service call failed.");
       return;
     }
 
     if (!set_mode.response.mode_sent)
     {
-      auto_land_result_ = "mode was not sent: " + reason;
-      ROS_ERROR("Auto-land request rejected (%s): mode_sent=false.", reason.c_str());
+      auto_land_result_ = "mode was not sent";
+      ROS_ERROR("Vision pose output timed out. MAVROS rejected AUTO.LAND request.");
       return;
     }
 
-    auto_land_result_ = "AUTO.LAND requested: " + reason;
-    ROS_ERROR("LIO drift detected (%s). AUTO.LAND requested through MAVROS.", reason.c_str());
+    auto_land_result_ = "AUTO.LAND requested: vision pose output timed out";
+    ROS_ERROR("Vision pose output stopped for %.1f s. AUTO.LAND requested through MAVROS.",
+              vision_pose_timeout_sec_);
   }
 
   void updateFrequencyEstimate()
@@ -289,18 +293,28 @@ private:
              max_position_jump_);
   }
 
-  void diagnosticsCallback(const ros::TimerEvent&)
+  void diagnosticsCallback(const ros::WallTimerEvent&)
   {
     const ros::WallTime now_wall = ros::WallTime::now();
     const double receive_age = received_count_ == 0
                                    ? 0.0
                                    : (now_wall - last_receive_wall_).toSec();
+    const double publish_age = published_count_ == 0
+                                   ? 0.0
+                                   : (now_wall - last_publish_wall_).toSec();
     const double frequency_window = receive_times_.size() >= 2
                                       ? (receive_times_.back() - receive_times_.front()).toSec()
                                       : 0.0;
     const double frequency = receive_times_.size() >= 2 && frequency_window > 1e-6
                                ? static_cast<double>(receive_times_.size() - 1) / frequency_window
                                : 0.0;
+
+    const bool vision_pose_is_stale =
+        published_count_ > 0 && publish_age > vision_pose_timeout_sec_;
+    if (vision_pose_is_stale && enable_vision_pose_timeout_protection_)
+    {
+      triggerAutoLand();
+    }
 
     diagnostic_msgs::DiagnosticArray array;
     array.header.stamp = ros::Time::now();
@@ -310,7 +324,14 @@ private:
     status.level = diagnostic_msgs::DiagnosticStatus::OK;
     status.message = "Operating normally";
 
-    if (received_count_ == 0)
+    if (vision_pose_is_stale)
+    {
+      status.level = diagnostic_msgs::DiagnosticStatus::ERROR;
+      status.message = enable_vision_pose_timeout_protection_
+                           ? "Vision pose output is stale; AUTO.LAND request attempted"
+                           : "Vision pose output is stale; auto-land protection disabled";
+    }
+    else if (received_count_ == 0)
     {
       status.level = diagnostic_msgs::DiagnosticStatus::WARN;
       status.message = "Waiting for odometry";
@@ -342,13 +363,16 @@ private:
     addDiagnosticValue(status, "invalid_drop_count", dropped_invalid_count_);
     addDiagnosticValue(status, "timestamp_drop_count", dropped_timestamp_count_);
     addDiagnosticValue(status, "drift_check_drop_count", dropped_drift_count_);
-    addDiagnosticValue(status, "auto_land_enabled", enable_auto_land_on_drift_ ? "true" : "false");
-    addDiagnosticValue(status, "auto_land_triggered", auto_land_triggered_ ? "true" : "false");
-    addDiagnosticValue(status, "auto_land_result", auto_land_result_);
     addDiagnosticValue(status, "frequency_hz", frequency);
     addDiagnosticValue(status, "nominal_frequency_hz", nominal_input_frequency_);
     addDiagnosticValue(status, "last_receive_age_sec", receive_age);
+    addDiagnosticValue(status, "last_publish_age_sec", publish_age);
     addDiagnosticValue(status, "last_message_delay_sec", last_delay_sec_);
+    addDiagnosticValue(status, "vision_pose_timeout_sec", vision_pose_timeout_sec_);
+    addDiagnosticValue(status, "vision_pose_timeout_protection_enabled",
+                       enable_vision_pose_timeout_protection_ ? "true" : "false");
+    addDiagnosticValue(status, "auto_land_triggered", auto_land_triggered_ ? "true" : "false");
+    addDiagnosticValue(status, "auto_land_result", auto_land_result_);
     array.status.push_back(status);
     diagnostics_pub_.publish(array);
   }
@@ -421,7 +445,7 @@ private:
   ros::Subscriber odom_sub_;
   ros::Publisher vision_pub_;
   ros::Publisher diagnostics_pub_;
-  ros::Timer diagnostics_timer_;
+  ros::WallTimer diagnostics_timer_;
   ros::ServiceClient set_mode_client_;
   Eigen::Isometry3d t_fcu_lio_body_ = Eigen::Isometry3d::Identity();
   std::string input_topic_;
@@ -437,11 +461,14 @@ private:
   double max_orientation_variance_ = 1.0;
   double max_position_jump_ = 2.0;
   double max_linear_speed_ = 10.0;
-  double max_angular_speed_ = 10.0;
-  bool enable_auto_land_on_drift_ = false;
+  double max_angular_speed_deg_ = 180.0;
+  double max_angular_speed_rad_ = std::acos(-1.0);
+  double vision_pose_timeout_sec_ = 1.0;
+  bool enable_vision_pose_timeout_protection_ = true;
   const double frequency_window_ = 2.0;
   const double frequency_learning_window_ = 1.0;
   ros::WallTime last_receive_wall_;
+  ros::WallTime last_publish_wall_;
   std::deque<ros::WallTime> receive_times_;
   double nominal_input_frequency_ = 0.0;
   bool frequency_learned_ = false;

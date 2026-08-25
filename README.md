@@ -23,11 +23,12 @@
 
 ### 简化监控参数
 
-只需要在 `config/odom_to_mavros.yaml` 中配置两个值：
+只需要在 `config/odom_to_mavros.yaml` 中配置以下监控参数：
 
 - `max_flight_speed`：无人机最大正常飞行速度，单位为 `m/s`。建议填实际最大速度，不要填理论极限。
-- `max_angular_speed`：无人机最大正常角速度，单位为 `rad/s`。
-- `enable_auto_land_on_drift`：是否在检测到 LIO 漂移/异常时通过 `/mavros/set_mode` 请求 `AUTO.LAND`，默认 `false`。
+- `max_angular_speed`：无人机最大正常角速度，单位为 `deg/s`。程序内部会转换为 `rad/s` 后进行比较。
+- `vision_pose_timeout`：最后一次成功发布 vision pose 后的允许中断时间，单位为 `s`，默认 `1.0`；通常设为 `0.5` 至 `1.0`。
+- `enable_vision_pose_timeout_protection`：是否在 vision pose 超时时请求 `AUTO.LAND`，默认 `true`。关闭后只报告诊断错误，不改变飞行模式。
 
 输入频率不需要配置，程序会根据里程计消息的实际到达时间自动估计，适用于 FAST-LIO、其他 LIO 或任何 `nav_msgs/Odometry` 发布器。频率估计完成后会在终端打印自动生成的阈值。
 
@@ -44,7 +45,9 @@ max_message_age = max(3 / learned_input_frequency, 0.2)
 
 ```yaml
 max_flight_speed: 5.0
-max_angular_speed: 10.0
+max_angular_speed: 180.0
+vision_pose_timeout: 1.0
+enable_vision_pose_timeout_protection: true
 ```
 
 程序自动得到：最大允许线速度 `10 m/s`、单帧最大跳变 `2 m`、最低输入频率 `5 Hz`、最大消息延迟 `0.3 s`。
@@ -63,7 +66,7 @@ max_angular_speed: 10.0
 - 协方差无效，或位置/姿态协方差超过程序内置阈值。
 - 相邻位姿位置跳变过大。
 - 根据相邻位姿计算出的线速度超过自动计算的允许值。
-- 根据相邻姿态计算出的角速度超过 `max_angular_speed`。
+- 根据相邻姿态计算出的角速度超过 `max_angular_speed`（单位 `deg/s`）。
 - 外参变换后的位姿包含非法数值。
 
 程序启动后会根据里程计消息的实际到达时间自动估计输入频率。频率估计完成后，自动生成最低输入频率、最大消息延迟和单帧最大位置跳变阈值。输入频率过低会产生诊断告警；如果消息仍在到达，频率过低本身不会单独丢弃消息。
@@ -76,7 +79,7 @@ max_angular_speed: 10.0
 
 判断绝对漂移需要 GPS/RTK、动捕、UWB 或其他外部定位参考。诊断信息发布在 `/diagnostics`，可以查看输入频率、消息延迟、发布数量和各类丢弃计数。LIO 失效后，bridge 不会发送最后一帧旧位姿，最终是否触发 PX4 failsafe 由 PX4 的 EKF 和 failsafe 参数决定。
 
-当 `enable_auto_land_on_drift: true` 时，程序在检测到协方差恶化、位置跳变、线速度异常或角速度异常后，会停止发送异常位姿，并通过 `/mavros/set_mode` 请求 `AUTO.LAND`。同一次 bridge 运行期间只请求一次；请求结果会写入终端和 `/diagnostics`。该功能只在检测到位姿质量或运动异常时触发，LIO 单纯断流不会由本节点自动请求降落。开启前必须确认飞控处于允许切换模式的状态，并在仿真环境中验证。
+检测到协方差恶化、位置跳变、线速度异常或角速度异常时，本节点只会丢弃异常帧并发布诊断，不会立即请求 PX4 切换 `AUTO.LAND`。当 `enable_vision_pose_timeout_protection: true` 时，节点在已经成功发布过 vision pose 后、连续超过 `vision_pose_timeout` 未再成功发布时，才会通过 `/mavros/set_mode` 请求 `AUTO.LAND`；启动时尚未发布任何位姿不会触发。关闭该开关后只会上报诊断错误。只要有效 vision pose 持续发布，本节点不会改变飞行模式。PX4 因估计器、Offboard、遥控器、电池或其他 failsafe 自主进入降落模式，属于飞控侧行为。
 
 ### 外参配置
 

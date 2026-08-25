@@ -13,11 +13,14 @@ extrinsic:
     pitch: 0.0
     yaw: 0.0
 
-# 只需要配置下面两个监控参数，单位分别为 m/s 和 rad/s。
+# 以下是监控和超时保护参数；速度单位分别为 m/s 和 deg/s。
 # max_flight_speed：无人机最大正常飞行速度，不要填理论极限速度。
 max_flight_speed: 5.0
-# max_angular_speed：无人机最大正常角速度，单位为 rad/s。
-max_angular_speed: 10.0
-# enable_auto_land_on_drift：检测到 LIO 漂移/异常时是否请求 MAVROS 切换 AUTO.LAND。
-# 默认关闭。开启前请确认 PX4 已正确配置 AUTO.LAND 和相关 failsafe 行为。
-enable_auto_land_on_drift: false
+# max_angular_speed：无人机最大正常角速度，单位为 deg/s。程序内部会转换为 rad/s。
+max_angular_speed: 180.0
+
+# vision_pose_timeout：成功发布 vision pose 后，超过该时间未再次成功发布时判定为超时，单位为秒。
+vision_pose_timeout: 1.0
+# enable_vision_pose_timeout_protection：是否在 vision pose 超时时通过 MAVROS 请求 AUTO.LAND。
+# 关闭后仍会在 /diagnostics 报告超时，但不会请求切换飞行模式。
+enable_vision_pose_timeout_protection: true
