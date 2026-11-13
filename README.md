@@ -206,6 +206,20 @@ rostopic echo /diagnostics
 
 根据丢弃计数检查时间戳、数值、外参及运动阈值。只修改 `frame_id` 不会修正坐标系方向。
 
+同时确认桥接输出频率：
+
+```bash
+rostopic hz /mavros/vision_pose/pose
+```
+
+查看一帧输出的位置、四元数与时间戳：
+
+```bash
+rostopic echo -n 1 /mavros/vision_pose/pose
+```
+
+若修改了 launch 中的话题名，请同步替换上述命令中的话题。输入有频率而输出没有时，可在 `/diagnostics` 中对照 `received_count`、`published_count` 与各项丢弃计数定位原因；输出正常仅表示桥接正在发布，不代表飞控已融合该位姿。
+
 ### 刚启动就触发 LAND
 
 检查上游是否已就绪，以及 `startup_timeout` 是否覆盖 LIO 初始化时间。该规则对地面冷启动与空中重启都生效，本节点不判断飞机是否在空中。
