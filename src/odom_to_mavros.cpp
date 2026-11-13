@@ -1,28 +1,30 @@
+#include "bounded_process.h"
+#include "extrinsic_validation.h"
+#include "landing_task.h"
+#include "safety_monitor.h"
+
 #include <Eigen/Geometry>
-#include <geometry_msgs/PoseStamped.h>
-#include <mavros_msgs/SetMode.h>
-#include <nav_msgs/Odometry.h>
 #include <diagnostic_msgs/DiagnosticArray.h>
 #include <diagnostic_msgs/DiagnosticStatus.h>
 #include <diagnostic_msgs/KeyValue.h>
-#include <ros/ros.h>
+#include <geometry_msgs/PoseStamped.h>
+#include <mavros_msgs/SetMode.h>
+#include <nav_msgs/Odometry.h>
 #include <ros/callback_queue.h>
-#include <ros/spinner.h>
-#include "safety_monitor.h"
-#include "bounded_process.h"
-#include "extrinsic_validation.h"
 #include <ros/master.h>
 #include <ros/network.h>
+#include <ros/ros.h>
+#include <ros/spinner.h>
 #include <xmlrpcpp/XmlRpcValue.h>
-#include <limits.h>
-#include <cstring>
-#include <memory>
-#include <mutex>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
-#include <algorithm>
+#include <limits.h>
+#include <memory>
+#include <mutex>
 #include <string>
 
 class LioToMavros
@@ -30,45 +32,19 @@ class LioToMavros
 public:
   LioToMavros(ros::NodeHandle& nh, ros::NodeHandle& pnh)
   {
-    pnh.param<std::string>("input_topic", input_topic_, "/Odometry");
-    pnh.param<std::string>("output_topic", output_topic_, "/mavros/vision_pose/pose");
-    pnh.param<std::string>("frame_id", frame_id_, "world");
-    pnh.param<double>("max_flight_speed", max_flight_speed_, 5.0);
-    pnh.param<double>("max_angular_speed", max_angular_speed_deg_, 180.0);
-    pnh.param<double>("vision_pose_timeout", vision_pose_timeout_sec_, 0.2);
-    if (pnh.hasParam("land_service_timeout") &&
-        !pnh.getParam("land_service_timeout", land_service_timeout_))
-      throw std::runtime_error("land_service_timeout must be numeric");
-    if (!std::isfinite(land_service_timeout_) || land_service_timeout_ <= 0.0)
-      throw std::runtime_error("land_service_timeout must be finite and positive");
-    pnh.param<bool>("enable_vision_pose_timeout_protection",
-                    enable_vision_pose_timeout_protection_, true);
-
-    pnh.param<double>("invalid_pose_timeout", invalid_pose_timeout_, 0.05);
-    pnh.param<int>("invalid_pose_min_count", invalid_pose_min_count_, 3);
-    if (!std::isfinite(invalid_pose_timeout_) || invalid_pose_timeout_ <= 0.0 ||
-        invalid_pose_min_count_ < 2) {
-      ROS_FATAL("Invalid continuous-invalid-pose monitoring parameters");
-      ros::shutdown();
-      return;
-    }
-
-    if (!std::isfinite(max_flight_speed_) || !std::isfinite(max_angular_speed_deg_) ||
-        !std::isfinite(vision_pose_timeout_sec_) || max_flight_speed_ <= 0.0 ||
-        max_angular_speed_deg_ <= 0.0 || vision_pose_timeout_sec_ <= 0.0)
-    {
-      ROS_FATAL("Invalid monitoring parameters: max_flight_speed=%.3f, "
-                "max_angular_speed=%.3f deg/s, vision_pose_timeout=%.3f s",
-                max_flight_speed_, max_angular_speed_deg_, vision_pose_timeout_sec_);
-      ros::shutdown();
-      return;
-    }
-    max_angular_speed_rad_ = max_angular_speed_deg_ * std::acos(-1.0) / 180.0;
-
-    safety_.reset(new SafetyMonitor(vision_pose_timeout_sec_, invalid_pose_timeout_,
-                                    static_cast<unsigned>(invalid_pose_min_count_)));
+    loadParameters(pnh);
+    SafetyMonitor::Config health;
+    health.measurement_timeout = vision_pose_timeout_sec_;
+    health.invalid_duration = invalid_pose_timeout_;
+    health.consecutive_invalid_count = static_cast<unsigned>(invalid_pose_min_count_);
+    health.startup_timeout = startup_timeout_;
+    health.quality_window = quality_window_;
+    health.max_invalid_ratio = max_invalid_ratio_;
+    health.quality_min_samples = static_cast<unsigned>(quality_min_samples_);
+    safety_.reset(new SafetyMonitor(health, steadyNow()));
     max_message_age_ = vision_pose_timeout_sec_;
     max_linear_speed_ = max_flight_speed_ * 2.0;
+    max_angular_speed_rad_ = max_angular_speed_deg_ * std::acos(-1.0) / 180.0;
     loadExtrinsic(pnh);
 
     vision_pub_ = nh.advertise<geometry_msgs::PoseStamped>(output_topic_, 1);
@@ -84,6 +60,7 @@ public:
                              ros::TransportHints().tcpNoDelay());
     watchdog_nh_.reset(new ros::NodeHandle(nh));
     watchdog_nh_->setCallbackQueue(&watchdog_queue_);
+    prepareLandWorker();
     watchdog_timer_ = watchdog_nh_->createSteadyTimer(
         ros::WallDuration(0.01), &LioToMavros::watchdogCallback, this);
     watchdog_spinner_.reset(new ros::AsyncSpinner(1, &watchdog_queue_));
@@ -107,6 +84,8 @@ private:
   static const char* faultName(SafetyMonitor::Fault fault)
   {
     switch (fault) {
+      case SafetyMonitor::Fault::StartupTimeout: return "no valid odometry before startup deadline";
+      case SafetyMonitor::Fault::PoorQuality: return "high invalid odometry ratio";
       case SafetyMonitor::Fault::Timeout: return "measurement timeout";
       case SafetyMonitor::Fault::InvalidSequence: return "continuous invalid poses";
       default: return "none";
@@ -117,13 +96,18 @@ private:
 
   void evaluateSafety()
   {
-    // Only watchdog callbacks own the request state. Diagnostics take a copy
-    // under this separate mutex; odometry never takes this mutex.
+    // Only this callback queue advances the single-flight LAND task.
+    // Diagnostics copy its status under the same lock; odometry never takes it.
     std::lock_guard<std::mutex> lock(land_state_mutex_);
     pollLandRequest();
     const auto fault = safety_->fault(steadyNow());
-    if (fault != SafetyMonitor::Fault::None)
-      triggerAutoLand(faultName(fault));
+    if (enable_vision_pose_timeout_protection_ &&
+        fault != SafetyMonitor::Fault::None && land_task_.latch(faultName(fault))) {
+      ROS_ERROR("LIO failure: %s. LAND request pending until successfully sent.", land_task_.reason().c_str());
+    }
+    if (land_task_.sent() || !enable_vision_pose_timeout_protection_) return;
+    prepareLandWorker();
+    if (land_task_.pending()) triggerAutoLand();
   }
 
   void odomCallback(const nav_msgs::Odometry::ConstPtr& msg)
@@ -136,23 +120,26 @@ private:
     {
       receive_times_.pop_front();
     }
-    last_receive_wall_ = receive_time;
+    last_receive_time_ = receive_time;
     updateFrequencyEstimate();
 
     const ros::Time now = ros::Time::now();
     if (!ros::Time::isValid() || now.isZero()) {
       ++dropped_timestamp_count_;
+      safety_->reject(steadyNow());
       return;
     }
     if (msg->header.stamp.isZero())
     {
       ++dropped_timestamp_count_;
+      safety_->reject(steadyNow());
       ROS_WARN_THROTTLE(1.0, "Received odometry with zero timestamp, skip this message.");
       return;
     }
     if (last_stamp_valid_ && msg->header.stamp < last_stamp_)
     {
       ++dropped_timestamp_count_;
+      safety_->reject(steadyNow());
       ROS_WARN_THROTTLE(1.0, "Received out-of-order odometry timestamp, skip this message.");
       return;
     }
@@ -162,6 +149,7 @@ private:
       if (timestamp_error > max_future_offset_)
       {
         ++dropped_timestamp_count_;
+        safety_->reject(steadyNow());
         ROS_WARN_THROTTLE(1.0, "Odometry timestamp is %.3f s in the future, skip this message.",
                           timestamp_error);
         return;
@@ -170,6 +158,7 @@ private:
       if (last_delay_sec_ >= std::min(max_message_age_, vision_pose_timeout_sec_))
       {
         ++dropped_timestamp_count_;
+        safety_->reject(steadyNow());
         ROS_WARN_THROTTLE(1.0, "Odometry is %.3f s old, skip this message.", last_delay_sec_);
         return;
       }
@@ -263,6 +252,7 @@ private:
       if (dt <= 0.0)
       {
         ++dropped_timestamp_count_;
+        safety_->reject(steadyNow());
         ROS_WARN_THROTTLE(1.0, "Odometry timestamp did not advance, skip this message.");
         return;
       }
@@ -295,6 +285,7 @@ private:
         source_age >= std::min(max_message_age_, vision_pose_timeout_sec_) ||
         !safety_->accept(steadyNow(), std::max(0.0, source_age))) {
       ++dropped_timestamp_count_;
+      safety_->reject(steadyNow());
       return;
     }
 
@@ -320,47 +311,59 @@ private:
     vision_pose.pose.orientation.w = q_world_fcu.w();
 
     vision_pub_.publish(vision_pose);
-    last_publish_wall_ = ros::SteadyTime::now();
+    last_publish_time_ = ros::SteadyTime::now();
     ++published_count_;
   }
 
-  void triggerAutoLand(const char* reason)
+  void prepareLandWorker()
   {
-    if (!enable_vision_pose_timeout_protection_ || auto_land_triggered_ ||
-        land_request_.running() ||
-        (!last_land_attempt_.isZero() &&
-         (ros::SteadyTime::now() - last_land_attempt_).toSec() < 0.5))
-      return;
-
-    last_land_attempt_ = ros::SteadyTime::now();
+    if (!enable_vision_pose_timeout_protection_ || land_request_.running() ||
+        steadyNow() < next_worker_start_) return;
     const int error = land_request_.start(worker_executable_,
         {"--land-service-worker", land_service_name_, "__master:=" + ros::master::getURI(),
          "__hostname:=" + ros::network::getHost()},
-        steadyNow(), land_service_timeout_);
+        steadyNow(), worker_startup_timeout_, true);
     if (error != 0) {
-      auto_land_result_ = std::string("Cannot start LAND request: ") + std::strerror(error);
+      next_worker_start_ = steadyNow() + kLandRetryInterval;
+      auto_land_result_ = std::string("Cannot prepare LAND worker: ") + std::strerror(error);
       ROS_ERROR("%s", auto_land_result_.c_str());
+    }
+  }
+
+  void triggerAutoLand()
+  {
+    if (!land_request_.ready()) return;
+    const int error = land_request_.send(steadyNow(), land_service_timeout_);
+    if (error != 0) {
+      // The next poll reaps a worker that exited unexpectedly. It will be
+      // recreated without clearing the pending LAND task.
+      auto_land_result_ = std::string("Cannot command LAND worker: ") + std::strerror(error);
       return;
     }
-    auto_land_triggered_ = true;
+    request_started_ = true;
     auto_land_result_ = "AUTO.LAND request in progress";
-    ROS_ERROR("%s; requesting AUTO.LAND in a bounded worker.", reason);
+    ROS_ERROR("%s; sending AUTO.LAND through prepared worker.", land_task_.reason().c_str());
   }
 
   void pollLandRequest()
   {
     const auto result = land_request_.poll(steadyNow());
     if (result == BoundedProcess::Result::Idle ||
-        result == BoundedProcess::Result::Running) return;
-    if (result == BoundedProcess::Result::Success) {
-      auto_land_result_ = "AUTO.LAND request sent (mode not confirmed)";
+        result == BoundedProcess::Result::Running ||
+        result == BoundedProcess::Result::Ready) return;
+    if (request_started_ && result == BoundedProcess::Result::Success) {
+      land_task_.markSent();
+      auto_land_result_ = "AUTO.LAND request sent; single-flight task complete";
+      ROS_WARN("%s", auto_land_result_.c_str());
     } else {
-      auto_land_triggered_ = false;
       auto_land_result_ = result == BoundedProcess::Result::TimedOut
-          ? "AUTO.LAND request timed out; worker terminated and reaped"
-          : "AUTO.LAND request failed";
-      ROS_ERROR("%s; will retry while input remains invalid.", auto_land_result_.c_str());
+          ? "LAND worker timed out and was reaped"
+          : "LAND worker failed";
+      next_worker_start_ = steadyNow() + kLandRetryInterval;
+      ROS_ERROR("%s; pending LAND requests will retry even if odometry recovers.",
+                auto_land_result_.c_str());
     }
+    request_started_ = false;
   }
 
   void updateFrequencyEstimate()
@@ -399,13 +402,13 @@ private:
 
   void diagnosticsCallback(const ros::SteadyTimerEvent&)
   {
-    const ros::SteadyTime now_wall = ros::SteadyTime::now();
+    const ros::SteadyTime now_steady = ros::SteadyTime::now();
     const double receive_age = received_count_ == 0
                                    ? 0.0
-                                   : (now_wall - last_receive_wall_).toSec();
+                                   : (now_steady - last_receive_time_).toSec();
     const double publish_age = published_count_ == 0
                                    ? 0.0
-                                   : (now_wall - last_publish_wall_).toSec();
+                                   : (now_steady - last_publish_time_).toSec();
     const double frequency_window = receive_times_.size() >= 2
                                       ? (receive_times_.back() - receive_times_.front()).toSec()
                                       : 0.0;
@@ -419,7 +422,7 @@ private:
     std::string land_result;
     {
       std::lock_guard<std::mutex> lock(land_state_mutex_);
-      land_triggered = auto_land_triggered_;
+      land_triggered = land_task_.triggered();
       land_result = auto_land_result_;
     }
 
@@ -504,6 +507,42 @@ private:
     addDiagnosticValue(status, key, std::to_string(value));
   }
 
+  template<class T>
+  static void readParameter(const ros::NodeHandle& pnh, const std::string& key, T& value)
+  {
+    if (pnh.hasParam(key) && !pnh.getParam(key, value))
+      throw std::runtime_error("Invalid parameter type: " + key);
+  }
+
+  void loadParameters(const ros::NodeHandle& pnh)
+  {
+    readParameter(pnh, "input_topic", input_topic_);
+    readParameter(pnh, "output_topic", output_topic_);
+    readParameter(pnh, "frame_id", frame_id_);
+    readParameter(pnh, "max_flight_speed", max_flight_speed_);
+    readParameter(pnh, "max_angular_speed", max_angular_speed_deg_);
+    readParameter(pnh, "vision_pose_timeout", vision_pose_timeout_sec_);
+    readParameter(pnh, "enable_vision_pose_timeout_protection", enable_vision_pose_timeout_protection_);
+    readParameter(pnh, "invalid_pose_timeout", invalid_pose_timeout_);
+    readParameter(pnh, "invalid_pose_min_count", invalid_pose_min_count_);
+    readParameter(pnh, "startup_timeout", startup_timeout_);
+    readParameter(pnh, "quality_window", quality_window_);
+    readParameter(pnh, "max_invalid_ratio", max_invalid_ratio_);
+    readParameter(pnh, "quality_min_samples", quality_min_samples_);
+    readParameter(pnh, "land_service_timeout", land_service_timeout_);
+    readParameter(pnh, "land_worker_startup_timeout", worker_startup_timeout_);
+
+    for (double value : {max_flight_speed_, max_angular_speed_deg_, vision_pose_timeout_sec_,
+                         invalid_pose_timeout_, startup_timeout_, quality_window_,
+                         land_service_timeout_, worker_startup_timeout_})
+      if (!std::isfinite(value) || value <= 0.0)
+        throw std::runtime_error("Speed/time parameters must be finite and positive");
+    if (invalid_pose_min_count_ < 2 || quality_min_samples_ < 2 || quality_min_samples_ > 4096 ||
+        !std::isfinite(max_invalid_ratio_) || max_invalid_ratio_ <= 0.0 || max_invalid_ratio_ > 1.0 ||
+        quality_window_ <= invalid_pose_timeout_)
+      throw std::runtime_error("Invalid odometry quality thresholds");
+  }
+
   void loadExtrinsic(const ros::NodeHandle& pnh)
   {
     double x = 0.0;
@@ -566,19 +605,23 @@ private:
   std::mutex land_state_mutex_;
   double invalid_pose_timeout_ = 0.05;
   int invalid_pose_min_count_ = 3;
+  double startup_timeout_ = 5.0;
+  double quality_window_ = 0.2;
+  double max_invalid_ratio_ = 0.7;
+  int quality_min_samples_ = 10;
+  double worker_startup_timeout_ = 2.0;
   BoundedProcess land_request_;
   double land_service_timeout_ = 0.3;
   std::string worker_executable_;
   std::string land_service_name_;
-  ros::SteadyTime last_land_attempt_;
   ros::Subscriber odom_sub_;
   ros::Publisher vision_pub_;
   ros::Publisher diagnostics_pub_;
   ros::SteadyTimer diagnostics_timer_;
   Eigen::Isometry3d t_fcu_lio_body_ = Eigen::Isometry3d::Identity();
-  std::string input_topic_;
-  std::string output_topic_;
-  std::string frame_id_;
+  std::string input_topic_ = "/Odometry";
+  std::string output_topic_ = "/mavros/vision_pose/pose";
+  std::string frame_id_ = "world";
   double max_flight_speed_ = 5.0;
   // Always capped by the measurement timeout, including during startup.
   double max_message_age_ = 0.2;
@@ -595,8 +638,8 @@ private:
   bool enable_vision_pose_timeout_protection_ = true;
   const double frequency_window_ = 2.0;
   const double frequency_learning_window_ = 1.0;
-  ros::SteadyTime last_receive_wall_;
-  ros::SteadyTime last_publish_wall_;
+  ros::SteadyTime last_receive_time_;
+  ros::SteadyTime last_publish_time_;
   std::deque<ros::SteadyTime> receive_times_;
   double nominal_input_frequency_ = 0.0;
   bool frequency_learned_ = false;
@@ -612,32 +655,41 @@ private:
   uint64_t dropped_invalid_count_ = 0;
   uint64_t dropped_timestamp_count_ = 0;
   uint64_t dropped_drift_count_ = 0;
-  bool auto_land_triggered_ = false;
+  LandingTask land_task_;
+  bool request_started_ = false;
+  double next_worker_start_ = 0.0;
+  static constexpr double kLandRetryInterval = 0.5;
   std::string auto_land_result_ = "not requested";
 };
 
+// Initialize ROS once, then wait for a private command from the parent.
+static int runLandWorker(int argc, char** argv)
+{
+  const std::string service_name = argv[2];
+  try {
+    ros::init(argc, argv, "odom_to_mavros_land_worker_" + std::to_string(::getppid()),
+              ros::init_options::NoRosout | ros::init_options::NoSigintHandler);
+    ros::NodeHandle nh;
+    auto client = nh.serviceClient<mavros_msgs::SetMode>(service_name);
+    if (::send(STDIN_FILENO, "R", 1, MSG_NOSIGNAL) != 1) return 2;
+    char command = 0;
+    ssize_t count;
+    do { count = ::read(STDIN_FILENO, &command, 1); } while (count < 0 && errno == EINTR);
+    if (count != 1 || command != 'L') return 2;
+    mavros_msgs::SetMode request;
+    request.request.base_mode = 0;
+    request.request.custom_mode = "AUTO.LAND";
+    return client.call(request) && request.response.mode_sent ? 0 : 2;
+  } catch (const std::exception& error) {
+    ROS_ERROR("LAND worker failed: %s", error.what());
+    return 2;
+  }
+}
+
 int main(int argc, char** argv)
 {
-  // A separate process makes a blocked roscpp call cancellable without leaking
-  // threads or waiting on a future destructor in the watchdog/main process.
-  if (argc >= 3 && std::string(argv[1]) == "--land-service-worker") {
-    const std::string service_name = argv[2];
-    try {
-      // Reuse one private worker name per parent. No rosout publisher is
-      // registered by short-lived workers, including ones killed on timeout.
-      ros::init(argc, argv, "odom_to_mavros_land_worker_" + std::to_string(::getppid()),
-                ros::init_options::NoRosout | ros::init_options::NoSigintHandler);
-      ros::NodeHandle nh;
-      auto client = nh.serviceClient<mavros_msgs::SetMode>(service_name);
-      mavros_msgs::SetMode request;
-      request.request.base_mode = 0;
-      request.request.custom_mode = "AUTO.LAND";
-      return client.call(request) && request.response.mode_sent ? 0 : 2;
-    } catch (const std::exception& error) {
-      ROS_ERROR("LAND service worker failed: %s", error.what());
-      return 2;
-    }
-  }
+  if (argc >= 3 && std::string(argv[1]) == "--land-service-worker")
+    return runLandWorker(argc, argv);
 
   ros::init(argc, argv, "odom_to_mavros");
   ros::NodeHandle nh;

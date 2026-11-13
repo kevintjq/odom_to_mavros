@@ -1,37 +1,40 @@
+# T_fcu_lio_body：LIO body 到 FCU body 的变换。
+# translation：LIO body 原点在 FCU body 中的位置（米）。
+# rotation：LIO body 相对 FCU body 的姿态，Rz(yaw) Ry(pitch) Rx(roll)。
 extrinsic:
-  # T_fcu_lio_body：LIO body 坐标系到飞控 FCU body 坐标系的外参。
-  # translation：LIO body 原点在 FCU body 坐标系中的位置，单位为米。
-  # rotation：LIO body 坐标系相对于 FCU body 坐标系的姿态。
   translation:
     x: 0.0
     y: 0.0
     z: 0.0
   rotation:
-    # 角度单位，可选 rad（弧度）或 deg（角度）。
     unit: deg
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
 
-# 以下是监控和超时保护参数；速度单位分别为 m/s 和 deg/s。
-# max_flight_speed：无人机最大正常飞行速度，不要填理论极限速度。
+# 正常飞行速度上限，分别为 m/s 和 deg/s。
 max_flight_speed: 5.0
-# max_angular_speed：无人机最大正常角速度，单位为 deg/s。程序内部会转换为 rad/s。
 max_angular_speed: 180.0
 
-# vision_pose_timeout：最后有效测量的最大年龄，包含传输/处理延迟，单位为秒。
+# 从采集时刻计算有效测量年龄，包含传输/处理延迟。
 vision_pose_timeout: 0.2
-# enable_vision_pose_timeout_protection：是否在测量过期或连续无效位姿时请求 AUTO.LAND。
-# 关闭后仍会在 /diagnostics 报告超时，但不会请求切换飞行模式。
-enable_vision_pose_timeout_protection: true
+# 启动/重启后仍未收到有效位姿的最长等待时间（秒）。
+# 普通地面冷启动同样适用；本节点不判断飞机是否在空中。
+startup_timeout: 5.0
 
-
-# 连续无效位姿的快速失效判据：必须同时满足条数和持续时间。
-# 有效位姿会清零计数；时间戳错误/旧数据通过 vision_pose_timeout 处理。
-# 默认值需结合实际 LIO 抖动、日志和仿真验证。
+# 连续异常：条数和持续时间必须同时满足。
 invalid_pose_min_count: 3
 invalid_pose_timeout: 0.05
 
-# 单次 LAND 服务工作进程的超时，包含进程启动、ROS连接和调用/退出时间。
-# 超时后终止并回收工作进程；持续失效时按原有至少 0.5 秒间隔重试。
+# 间歇性异常：窗口内至少有这些样本，跨度至少 invalid_pose_timeout，
+# 且异常占比 >= max_invalid_ratio。单帧正常数据不会清空窗口。
+quality_window: 0.2
+quality_min_samples: 10
+max_invalid_ratio: 0.7
+
+# false：只过滤数据和报告诊断，不启动 LAND 工作进程、不发送请求。
+enable_vision_pose_timeout_protection: true
+# 工作进程在正常阶段提前初始化，准备超时会回收重建。
+land_worker_startup_timeout: 2.0
+# 唤醒已准备好的工作进程后，服务调用/退出的最长等待时间。
 land_service_timeout: 0.3

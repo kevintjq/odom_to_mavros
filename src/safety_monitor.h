@@ -3,64 +3,103 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
+#include <deque>
 #include <mutex>
 
-// All time arguments are seconds from a monotonic clock. ROS time is used
-// only to compute measurement_age at the bridge boundary.
+// Input-only health checks. All time arguments use a monotonic clock.
 class SafetyMonitor
 {
 public:
-  enum class Fault { None, Timeout, InvalidSequence };
-  SafetyMonitor(double timeout, double invalid_timeout, unsigned invalid_count)
-    : timeout_(timeout), invalid_timeout_(invalid_timeout), min_invalid_(invalid_count) {}
+  struct Config
+  {
+    double measurement_timeout = 0.2;
+    double invalid_duration = 0.05;
+    unsigned consecutive_invalid_count = 3;
+    double startup_timeout = 5.0;
+    double quality_window = 0.2;
+    double max_invalid_ratio = 0.7;
+    unsigned quality_min_samples = 10;
+  };
+  enum class Fault { None, StartupTimeout, Timeout, InvalidSequence, PoorQuality };
+
+  SafetyMonitor(const Config& config, double now)
+    : config_(config), startup_deadline_(now + config.startup_timeout) {}
 
   bool accept(double now, double measurement_age)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!std::isfinite(measurement_age) ||
-        measurement_age < 0.0 || measurement_age >= timeout_)
+    if (!std::isfinite(measurement_age) || measurement_age < 0.0 ||
+        measurement_age >= config_.measurement_timeout)
       return false;
-    // A delayed packet only provides the remaining part of its lifetime.
-    const double deadline = now + timeout_ - measurement_age;
+    // Delay already consumed part of this measurement's usable lifetime.
+    const double deadline = now + config_.measurement_timeout - measurement_age;
     deadline_ = active_ ? std::max(deadline_, deadline) : deadline;
     active_ = true;
-    invalid_count_ = 0;
+    consecutive_invalid_ = 0;
+    recordSample(now, true);  // One good sample does not erase the quality window.
     return true;
   }
 
   void reject(double now)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    // Widely separated invalid packets are not a continuous burst.
-    if (invalid_count_ == 0 || now - last_invalid_ >= timeout_) {
-      invalid_count_ = 0;
+    if (consecutive_invalid_ == 0 || now - last_invalid_ >= config_.measurement_timeout) {
+      consecutive_invalid_ = 0;
       first_invalid_ = now;
     }
-    if (invalid_count_ < min_invalid_) ++invalid_count_;
+    if (consecutive_invalid_ < config_.consecutive_invalid_count)
+      ++consecutive_invalid_;
     last_invalid_ = now;
+    recordSample(now, false);
   }
 
-  Fault fault(double now) const
+  Fault fault(double now)
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!active_) return Fault::None;  // Preserve the existing startup guard.
-    if (invalid_count_ >= min_invalid_ && now - first_invalid_ >= invalid_timeout_)
-      return Fault::InvalidSequence;
+    pruneSamples(now);
+    if (!active_)
+      return now >= startup_deadline_ ? Fault::StartupTimeout : Fault::None;
     if (now >= deadline_) return Fault::Timeout;
+    if (consecutive_invalid_ >= config_.consecutive_invalid_count &&
+        now - first_invalid_ >= config_.invalid_duration)
+      return Fault::InvalidSequence;
+    if (samples_.size() >= config_.quality_min_samples &&
+        samples_.back().time - samples_.front().time >= config_.invalid_duration &&
+        static_cast<double>(invalid_samples_) / samples_.size() >= config_.max_invalid_ratio)
+      return Fault::PoorQuality;
     return Fault::None;
   }
 
 private:
-  const double timeout_;
-  const double invalid_timeout_;
-  const unsigned min_invalid_;
-  mutable std::mutex mutex_;
+  struct Sample { double time; bool valid; };
+  void pruneSamples(double now)
+  {
+    while (!samples_.empty() && now - samples_.front().time > config_.quality_window) {
+      if (!samples_.front().valid) --invalid_samples_;
+      samples_.pop_front();
+    }
+  }
+  void recordSample(double now, bool valid)
+  {
+    pruneSamples(now);
+    // Bound memory even if a faulty source floods the callback queue.
+    if (samples_.size() >= 4096) {
+      if (!samples_.front().valid) --invalid_samples_;
+      samples_.pop_front();
+    }
+    samples_.push_back({now, valid});
+    if (!valid) ++invalid_samples_;
+  }
+
+  const Config config_;
+  const double startup_deadline_;
+  std::mutex mutex_;
+  std::deque<Sample> samples_;
+  unsigned invalid_samples_ = 0;
   bool active_ = false;
   double deadline_ = 0.0;
   double first_invalid_ = 0.0;
   double last_invalid_ = 0.0;
-  unsigned invalid_count_ = 0;
+  unsigned consecutive_invalid_ = 0;
 };
-
 #endif
