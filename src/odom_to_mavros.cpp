@@ -9,11 +9,16 @@
 #include <ros/callback_queue.h>
 #include <ros/spinner.h>
 #include "safety_monitor.h"
+#include "bounded_process.h"
+#include "extrinsic_validation.h"
+#include <ros/master.h>
+#include <ros/network.h>
+#include <xmlrpcpp/XmlRpcValue.h>
+#include <limits.h>
+#include <cstring>
 #include <memory>
 #include <mutex>
 
-#include <future>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -31,6 +36,11 @@ public:
     pnh.param<double>("max_flight_speed", max_flight_speed_, 5.0);
     pnh.param<double>("max_angular_speed", max_angular_speed_deg_, 180.0);
     pnh.param<double>("vision_pose_timeout", vision_pose_timeout_sec_, 0.2);
+    if (pnh.hasParam("land_service_timeout") &&
+        !pnh.getParam("land_service_timeout", land_service_timeout_))
+      throw std::runtime_error("land_service_timeout must be numeric");
+    if (!std::isfinite(land_service_timeout_) || land_service_timeout_ <= 0.0)
+      throw std::runtime_error("land_service_timeout must be finite and positive");
     pnh.param<bool>("enable_vision_pose_timeout_protection",
                     enable_vision_pose_timeout_protection_, true);
 
@@ -63,7 +73,13 @@ public:
 
     vision_pub_ = nh.advertise<geometry_msgs::PoseStamped>(output_topic_, 1);
     diagnostics_pub_ = nh.advertise<diagnostic_msgs::DiagnosticArray>("/diagnostics", 1);
-    set_mode_client_ = nh.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
+    land_service_name_ = nh.resolveName("/mavros/set_mode");
+    char executable[PATH_MAX];
+    const ssize_t length = ::readlink("/proc/self/exe", executable, sizeof(executable) - 1);
+    if (length <= 0 || length >= static_cast<ssize_t>(sizeof(executable) - 1))
+      throw std::runtime_error("Cannot resolve LAND worker executable");
+    executable[length] = '\0';
+    worker_executable_ = executable;
     odom_sub_ = nh.subscribe(input_topic_, 1, &LioToMavros::odomCallback, this,
                              ros::TransportHints().tcpNoDelay());
     watchdog_nh_.reset(new ros::NodeHandle(nh));
@@ -311,43 +327,39 @@ private:
   void triggerAutoLand(const char* reason)
   {
     if (!enable_vision_pose_timeout_protection_ || auto_land_triggered_ ||
-        land_request_.valid() ||
+        land_request_.running() ||
         (!last_land_attempt_.isZero() &&
          (ros::SteadyTime::now() - last_land_attempt_).toSec() < 0.5))
       return;
 
-    // Copy the client; the worker never accesses node state.
     last_land_attempt_ = ros::SteadyTime::now();
-    ros::ServiceClient client = set_mode_client_;
-    land_request_ = std::async(std::launch::async, [client]() mutable {
-      mavros_msgs::SetMode request;
-      request.request.base_mode = 0;
-      request.request.custom_mode = "AUTO.LAND";
-      if (!client.call(request)) return 0;
-      return request.response.mode_sent ? 1 : 2;
-    });
+    const int error = land_request_.start(worker_executable_,
+        {"--land-service-worker", land_service_name_, "__master:=" + ros::master::getURI(),
+         "__hostname:=" + ros::network::getHost()},
+        steadyNow(), land_service_timeout_);
+    if (error != 0) {
+      auto_land_result_ = std::string("Cannot start LAND request: ") + std::strerror(error);
+      ROS_ERROR("%s", auto_land_result_.c_str());
+      return;
+    }
     auto_land_triggered_ = true;
     auto_land_result_ = "AUTO.LAND request in progress";
-    ROS_ERROR("%s; requesting AUTO.LAND asynchronously.", reason);
+    ROS_ERROR("%s; requesting AUTO.LAND in a bounded worker.", reason);
   }
 
   void pollLandRequest()
   {
-    if (!land_request_.valid() ||
-        land_request_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
-      return;
-    try {
-      const int result = land_request_.get();
-      auto_land_result_ = result == 1 ? "AUTO.LAND request sent (mode not confirmed)"
-                                    : "AUTO.LAND request failed";
-      if (result != 1) {
-        auto_land_triggered_ = false;
-        ROS_ERROR("AUTO.LAND request failed; will retry while output is stale.");
-      }
-    } catch (const std::exception& error) {
+    const auto result = land_request_.poll(steadyNow());
+    if (result == BoundedProcess::Result::Idle ||
+        result == BoundedProcess::Result::Running) return;
+    if (result == BoundedProcess::Result::Success) {
+      auto_land_result_ = "AUTO.LAND request sent (mode not confirmed)";
+    } else {
       auto_land_triggered_ = false;
-      auto_land_result_ = error.what();
-      ROS_ERROR("AUTO.LAND request failed: %s", error.what());
+      auto_land_result_ = result == BoundedProcess::Result::TimedOut
+          ? "AUTO.LAND request timed out; worker terminated and reaped"
+          : "AUTO.LAND request failed";
+      ROS_ERROR("%s; will retry while input remains invalid.", auto_land_result_.c_str());
     }
   }
 
@@ -462,6 +474,7 @@ private:
     addDiagnosticValue(status, "last_publish_age_sec", publish_age);
     addDiagnosticValue(status, "last_message_delay_sec", last_delay_sec_);
     addDiagnosticValue(status, "vision_pose_timeout_sec", vision_pose_timeout_sec_);
+    addDiagnosticValue(status, "land_service_timeout_sec", land_service_timeout_);
     addDiagnosticValue(status, "vision_pose_timeout_protection_enabled",
                        enable_vision_pose_timeout_protection_ ? "true" : "false");
     addDiagnosticValue(status, "auto_land_triggered", land_triggered ? "true" : "false");
@@ -501,25 +514,29 @@ private:
     double yaw = 0.0;
     std::string rpy_unit = "rad";
 
-    pnh.param<double>("extrinsic/translation/x", x, 0.0);
-    pnh.param<double>("extrinsic/translation/y", y, 0.0);
-    pnh.param<double>("extrinsic/translation/z", z, 0.0);
-    pnh.param<double>("extrinsic/rotation/roll", roll, 0.0);
-    pnh.param<double>("extrinsic/rotation/pitch", pitch, 0.0);
-    pnh.param<double>("extrinsic/rotation/yaw", yaw, 0.0);
-    pnh.param<std::string>("extrinsic/rotation/unit", rpy_unit, "rad");
-
-    if (rpy_unit == "deg" || rpy_unit == "degree" || rpy_unit == "degrees")
-    {
-      const double kDegToRad = std::acos(-1.0) / 180.0;
-      roll *= kDegToRad;
-      pitch *= kDegToRad;
-      yaw *= kDegToRad;
+    // Missing values retain the documented identity defaults. Present but
+    // incorrectly typed values must never silently fall back to those defaults.
+    const auto readNumber = [&](const std::string& key, double& value) {
+      if (pnh.hasParam(key) && !pnh.getParam(key, value))
+        throw std::runtime_error(key + " must be numeric");
+    };
+    for (const std::string group : {"extrinsic", "extrinsic/translation", "extrinsic/rotation"}) {
+      XmlRpc::XmlRpcValue value;
+      if (pnh.hasParam(group) &&
+          (!pnh.getParam(group, value) || value.getType() != XmlRpc::XmlRpcValue::TypeStruct))
+        throw std::runtime_error(group + " must be a parameter mapping");
     }
-    else if (rpy_unit != "rad" && rpy_unit != "radian" && rpy_unit != "radians")
-    {
-      ROS_WARN("Unknown extrinsic rotation unit '%s', use radians.", rpy_unit.c_str());
-    }
+    readNumber("extrinsic/translation/x", x);
+    readNumber("extrinsic/translation/y", y);
+    readNumber("extrinsic/translation/z", z);
+    readNumber("extrinsic/rotation/roll", roll);
+    readNumber("extrinsic/rotation/pitch", pitch);
+    readNumber("extrinsic/rotation/yaw", yaw);
+    if (pnh.hasParam("extrinsic/rotation/unit") &&
+        !pnh.getParam("extrinsic/rotation/unit", rpy_unit))
+      throw std::runtime_error("extrinsic/rotation/unit must be a string");
+    const auto values = validatedExtrinsic({{x, y, z, roll, pitch, yaw}}, rpy_unit);
+    roll = values[3]; pitch = values[4]; yaw = values[5];
 
     const Eigen::AngleAxisd roll_angle(roll, Eigen::Vector3d::UnitX());
     const Eigen::AngleAxisd pitch_angle(pitch, Eigen::Vector3d::UnitY());
@@ -529,6 +546,12 @@ private:
     t_fcu_lio_body_ = Eigen::Isometry3d::Identity();
     t_fcu_lio_body_.linear() = q_fcu_lio_body.toRotationMatrix();
     t_fcu_lio_body_.translation() = Eigen::Vector3d(x, y, z);
+
+    if (!t_fcu_lio_body_.matrix().allFinite() ||
+        !(t_fcu_lio_body_.linear().transpose() * t_fcu_lio_body_.linear())
+             .isApprox(Eigen::Matrix3d::Identity(), 1e-9) ||
+        std::abs(t_fcu_lio_body_.linear().determinant() - 1.0) > 1e-9)
+      throw std::runtime_error("Extrinsic did not produce a valid rigid transform");
 
     ROS_INFO("Loaded T_fcu_lio_body: xyz = [%.4f, %.4f, %.4f], "
              "rpy(rad) = [%.4f, %.4f, %.4f]",
@@ -543,13 +566,15 @@ private:
   std::mutex land_state_mutex_;
   double invalid_pose_timeout_ = 0.05;
   int invalid_pose_min_count_ = 3;
-  std::future<int> land_request_;
+  BoundedProcess land_request_;
+  double land_service_timeout_ = 0.3;
+  std::string worker_executable_;
+  std::string land_service_name_;
   ros::SteadyTime last_land_attempt_;
   ros::Subscriber odom_sub_;
   ros::Publisher vision_pub_;
   ros::Publisher diagnostics_pub_;
   ros::SteadyTimer diagnostics_timer_;
-  ros::ServiceClient set_mode_client_;
   Eigen::Isometry3d t_fcu_lio_body_ = Eigen::Isometry3d::Identity();
   std::string input_topic_;
   std::string output_topic_;
@@ -593,12 +618,36 @@ private:
 
 int main(int argc, char** argv)
 {
+  // A separate process makes a blocked roscpp call cancellable without leaking
+  // threads or waiting on a future destructor in the watchdog/main process.
+  if (argc >= 3 && std::string(argv[1]) == "--land-service-worker") {
+    const std::string service_name = argv[2];
+    try {
+      // Reuse one private worker name per parent. No rosout publisher is
+      // registered by short-lived workers, including ones killed on timeout.
+      ros::init(argc, argv, "odom_to_mavros_land_worker_" + std::to_string(::getppid()),
+                ros::init_options::NoRosout | ros::init_options::NoSigintHandler);
+      ros::NodeHandle nh;
+      auto client = nh.serviceClient<mavros_msgs::SetMode>(service_name);
+      mavros_msgs::SetMode request;
+      request.request.base_mode = 0;
+      request.request.custom_mode = "AUTO.LAND";
+      return client.call(request) && request.response.mode_sent ? 0 : 2;
+    } catch (const std::exception& error) {
+      ROS_ERROR("LAND service worker failed: %s", error.what());
+      return 2;
+    }
+  }
+
   ros::init(argc, argv, "odom_to_mavros");
   ros::NodeHandle nh;
   ros::NodeHandle pnh("~");
-
-  LioToMavros node(nh, pnh);
-  ros::spin();
+  try {
+    LioToMavros node(nh, pnh);
+    ros::spin();
+  } catch (const std::exception& error) {
+    ROS_FATAL("odom_to_mavros startup/runtime error: %s", error.what());
+    return 1;
+  }
   return 0;
 }
-

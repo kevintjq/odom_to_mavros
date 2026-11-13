@@ -51,6 +51,7 @@ vision_pose_timeout: 0.2   # 秒，最后有效测量的最大年龄
 invalid_pose_min_count: 3  # 连续无效位姿条数，至少 2
 invalid_pose_timeout: 0.05 # 秒，连续无效位姿最短持续时间
 enable_vision_pose_timeout_protection: true
+land_service_timeout: 0.3 # 秒，单次 LAND 工作进程的超时
 ```
 
 以上为初始默认值，尚未经本机飞行数据标定；应结合正常抖动和故障注入测试调整。总反应时间还包含检查调度、服务调用、通信和飞控模式切换时间。
@@ -75,7 +76,9 @@ YAML 填写 `T_fcu_lio_body`：LIO body 到 FCU body 的变换。
 
 - `translation`：LIO body 原点在 FCU body 系中的位置，单位米。
 - `rotation`：LIO body 相对 FCU body 的姿态，使用 `Rz(yaw) Ry(pitch) Rx(roll)`。
-- `unit`：`deg` 或 `rad`。
+- `unit`：`deg` 或 `rad`，兼容原有 `degree/degrees/radian/radians`；大小写敏感。
+- 启动时逐项拒绝 NaN/Inf、错误参数类型和非映射的外参配置；未知角度单位直接报错并以非零状态退出，不再回退到弧度。未填写的数值仍按零处理，未填写单位默认 `rad`。
+- 构造后检查变换矩阵是否有限、旋转是否正交且行列式接近 1。检查通过后才建立位姿发布和订阅。
 
 ```yaml
 extrinsic:
@@ -112,8 +115,21 @@ g++ -std=c++11 -Wall -Wextra -Werror -pthread -Isrc test/safety_monitor_test.cpp
 /tmp/odom_safety_test
 ```
 
-catkin 启用测试时也会注册 `safety_monitor_test`。测试覆盖启动保护、延迟数据期限、过期数据拒绝、单帧异常、连续异常、恢复和并发读写；不能替代完整 ROS 编译、回调队列集成测试或 SITL。
+单次服务请求/外参校验测试：
 
-LAND 服务仍在独立工作线程调用，失败时每隔至少 0.5 秒重试，最多一个在途请求。`mode_sent` 仅表示请求已发送，当前代码不确认飞控实际模式；服务永久阻塞的处理、降落状态锁存和任务节点协同尚未实现。PX4 的位置丢失/Offboard 丢失保护仍需独立配置验证，发出 LAND 请求不能保证降落成功。
+```bash
+g++ -std=c++11 -Wall -Wextra -Werror -pthread -Isrc test/request_and_extrinsic_test.cpp -o /tmp/request_and_extrinsic_test
+/tmp/request_and_extrinsic_test
+```
+
+该测试以长时间不退出的真实子进程模拟阻塞调用，验证超时终止、回收、反复重试、成功/失败退出和销毁时清理；还检查六个外参数值的 NaN/Inf 拒绝、角度换算和未知单位拒绝。它不覆盖 ROS 参数服务器的类型读取和真实 MAVROS 服务。
+
+catkin 启用测试时会注册 `safety_monitor_test` 和 `request_and_extrinsic_test`。测试覆盖启动保护、延迟数据期限、过期数据拒绝、单帧异常、连续异常、恢复和并发读写；不能替代完整 ROS 编译、回调队列集成测试或 SITL。
+
+LAND 服务在同一可执行文件的独立子进程中调用，使用 `posix_spawn` 启动，不经过 shell。默认单次进程超时为 0.3 秒，包含启动、ROS 连接、服务调用和退出。父进程使用单调时钟和非阻塞 `waitpid` 检查；超时后终止工作进程，回收后才允许新请求。不存在通过不断分离阻塞线程来重试的资源积累，最多一个在途工作进程。退出节点时也清理在途进程。
+
+失败或超时后，输入仍失效时按原有至少 0.5 秒的尝试间隔重试；不因为服务超时自行改变 LIO 判据。工作进程继承环境，显式沿用父节点的 ROS master、通告主机地址和解析后的服务名。实现面向 Linux/ROS1（使用 `/proc/self/exe` 和 POSIX 进程接口）。
+
+终止本地工作进程无法撤销已发往 MAVROS/飞控的请求，超时只表示本次结果未在期限内返回，重试可能再次发送相同 LAND 请求。`mode_sent` 仍仅表示请求已发送，当前代码不确认飞控实际模式；降落状态锁存和任务节点协同尚未实现。PX4 的位置丢失/Offboard 丢失保护仍需独立配置验证，发出 LAND 请求不能保证降落成功。
 
 建议在 SITL 注入：输入断流、持续延迟、NaN、协方差异常、位置跳变、里程计回调拥堵和 ROS 时间跳变；记录最后有效测量到请求发出的延迟，以及飞控实际模式变化。
