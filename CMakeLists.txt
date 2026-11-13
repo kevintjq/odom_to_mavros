@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
+  std_msgs
   diagnostic_msgs
   geometry_msgs
   mavros_msgs
@@ -108,7 +109,7 @@ find_package(Eigen3 REQUIRED)
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-  CATKIN_DEPENDS diagnostic_msgs geometry_msgs nav_msgs roscpp
+  CATKIN_DEPENDS diagnostic_msgs geometry_msgs mavros_msgs nav_msgs roscpp std_msgs
 #  INCLUDE_DIRS include
 #  LIBRARIES odom_to_mavros
 #  CATKIN_DEPENDS geometry_msgs mavros_msgs nav_msgs roscpp std_msgs tf tf2_eigen
@@ -187,3 +188,11 @@ target_link_libraries(odom_to_mavros_node
 
 ## Add folders to be run by python nosetests
 # catkin_add_nosetests(test)
+
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(safety_monitor_test test/safety_monitor_test.cpp)
+  target_include_directories(safety_monitor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(safety_monitor_test ${CMAKE_THREAD_LIBS_INIT})
+  add_test(NAME safety_monitor_test COMMAND safety_monitor_test)
+endif()

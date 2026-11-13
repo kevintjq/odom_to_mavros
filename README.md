@@ -1,107 +1,81 @@
 # odom_to_mavros
 
-将 SLAM Odom 输出的 `nav_msgs/Odometry` 转发为 MAVROS 可用的 `geometry_msgs/PoseStamped`，并支持通过 YAML 配置雷达到机体系的 6DoF 外参。
+ROS1 节点：把 LIO 的 `nav_msgs/Odometry` 转换成 MAVROS 的 `geometry_msgs/PoseStamped`，支持 LIO body 到 FCU body 的 6DoF 外参，并在本节点内判断输入失效、异步请求 `AUTO.LAND`。
 
-默认发布到：
+## 输入输出
 
-`/mavros/vision_pose/pose`
+- `input_topic`：默认 `/Odometry`。
+- `output_topic`：默认 `/mavros/vision_pose/pose`。
+- `frame_id`：默认 `world`，只是输出标签，不会自动变换世界坐标系。
+- `/diagnostics`：输入频率、消息延迟、发布/拒绝计数、当前失效原因和降落请求结果，每秒发布。
+- `/mavros/set_mode`：触发保护时异步请求 `AUTO.LAND`。
 
-## 功能
+不需要额外健康状态话题，也不修改 LIO 发布器。输入必须使用与本机 ROS 时间一致的采集时间戳，不能用转发时间重盖时间戳。
 
-- 订阅 SLAM Odom 里程计
-- 从 YAML 读取雷达到机体系外参
-- 将雷达位姿变换到机体系
-- 发布完整的位置和四元数
+## 失效判定
 
-## 话题与参数
+正常数据会经过时间戳、位置、四元数、协方差、外参转换和运动连续性检查，然后转发。
 
-### 输入输出
+| 情况 | 处理 |
+| --- | --- |
+| 停止接收、持续旧数据、零/重复/倒序时间戳 | 无法更新有效测量期限；达到 `vision_pose_timeout` 后请求 LAND |
+| 单帧 NaN/Inf、无效四元数、异常协方差或运动跳变 | 丢弃该帧，不立即请求 LAND |
+| 连续无效位姿 | 同时达到 `invalid_pose_min_count` 和 `invalid_pose_timeout` 后请求 LAND；常规测量超时仍独立生效 |
+| 收到并通过检查的新鲜位姿 | 更新有效测量期限，清零连续无效计数 |
+| 启动以来从未有有效位姿 | 等待输入，不触发 LAND，保留原有启动保护行为 |
 
-- `input_topic`：输入里程计话题，默认 `/Odometry`
-- `output_topic`：输出视觉位姿话题，默认 `/mavros/vision_pose/pose`
-- `frame_id`：消息头里的坐标系名，默认 `world`
+连续无效位姿包括非有限位置/姿态、接近零的四元数、负或非有限对角方差、过大方差、非法变换结果、过大位移/线速度/角速度。协方差上限保持为位置 `4 m²`、姿态 `1 rad²`，逐项检查六个对角元素；不检验整个协方差矩阵的半正定性。
 
-### 简化监控参数
+无效计数从第一帧异常开始，默认至少 3 帧且持续 0.05 秒；若此后没有有效数据恢复，看门狗也能在该时间到达时判定。相隔超过常规超时的异常帧不合并成一个连续序列。时间戳错误不计入快速异常序列，由有效测量年龄超时覆盖。
 
-只需要在 `config/odom_to_mavros.yaml` 中配置以下监控参数：
+**失效判断有边界：**仅靠里程计无法可靠区分静止与“位置冻结但时间戳仍更新”，也无法可靠识别连续的绝对漂移、数值正常的坐标系错误。这些情况不能承诺自动检出。
 
-- `max_flight_speed`：无人机最大正常飞行速度，单位为 `m/s`。建议填实际最大速度，不要填理论极限。
-- `max_angular_speed`：无人机最大正常角速度，单位为 `deg/s`。程序内部会转换为 `rad/s` 后进行比较。
-- `vision_pose_timeout`：最后一次成功发布 vision pose 后的允许中断时间，单位为 `s`，默认 `0.2`，按实际链路延迟调整。
-- `enable_vision_pose_timeout_protection`：是否在 vision pose 超时时请求 `AUTO.LAND`，默认 `true`。关闭后只报告诊断错误，不改变飞行模式。
+## 独立看门狗与数据新鲜度
 
-输入频率不需要配置，程序会根据里程计消息的实际到达时间自动估计，适用于 FAST-LIO、其他 LIO 或任何 `nav_msgs/Odometry` 发布器。频率估计完成后会在终端打印自动生成的阈值。
+- 看门狗使用独立 ROS 回调队列和一个独立 `AsyncSpinner` 线程，每 10 ms 检查；里程计/诊断回调拥堵不直接占用该队列。
+- 超时、重试间隔和输入频率使用 `ros::SteadyTime`，不依赖可跳变的系统墙钟。
+- ROS 时间只用于与输入采集时间戳比较。ROS 时间无效、未开始或消息时间异常时不接受数据；已建立的单调时钟期限仍会到期。
+- 输入订阅和输出发布队列都为 1，输入启用 TCP_NODELAY。正在处理的回调和网络缓冲仍可能带来延迟，因此发布前再次校验采集时间。
+- 期限按“单调时钟当前值 + 超时阈值 − 测量年龄”计算。默认阈值 0.2 秒，一帧已经延迟 0.15 秒的有效数据只剩约 0.05 秒有效期，不会重新获得完整 0.2 秒。
+- 消息年龄达到阈值即拒绝，包括启动阶段；频率学习不会把年龄上限放宽。允许的微小未来时间偏差仍为 0.1 秒，但不会给未来消息增加额外有效期。
+- 独立线程不提供硬实时保证。CPU 饱和、进程卡死、内核调度、MAVROS/链路延迟仍会影响响应。
 
-程序会自动计算其余阈值：
+## 配置
 
-```text
-max_linear_speed  = max_flight_speed * 2
-max_position_jump = max_linear_speed / learned_input_frequency * 2
-实际跳变上限 = max(max_position_jump, max_linear_speed * 相邻有效位姿时间差)
-min_input_frequency = learned_input_frequency * 0.5
-max_message_age = max(3 / learned_input_frequency, 0.2)
-```
-
-例如无人机最大正常速度为 `5 m/s`，程序自动测得输入频率为 `10 Hz`：
+`launch/odom_to_mavros.launch` 加载 `config/odom_to_mavros.yaml`：
 
 ```yaml
-max_flight_speed: 5.0
-max_angular_speed: 180.0
-vision_pose_timeout: 0.2
+max_flight_speed: 5.0       # m/s，正常飞行速度上限
+max_angular_speed: 180.0   # deg/s
+vision_pose_timeout: 0.2   # 秒，最后有效测量的最大年龄
+invalid_pose_min_count: 3  # 连续无效位姿条数，至少 2
+invalid_pose_timeout: 0.05 # 秒，连续无效位姿最短持续时间
 enable_vision_pose_timeout_protection: true
 ```
 
-程序自动得到：最大允许线速度 `10 m/s`、单帧最大跳变 `2 m`、最低输入频率 `5 Hz`、最大消息延迟 `0.3 s`。
+以上为初始默认值，尚未经本机飞行数据标定；应结合正常抖动和故障注入测试调整。总反应时间还包含检查调度、服务调用、通信和飞控模式切换时间。
 
-协方差阈值、未来时间容差和诊断周期使用代码内固定值。检测到非法数据、定位质量恶化、位姿跳变、速度异常或输入过期时，消息会被丢弃，并通过终端 warning 和 `/diagnostics` 报告。该检测可以发现数据跳变或定位质量恶化，但不能单独证明缓慢的绝对漂移。
+`enable_vision_pose_timeout_protection: false` 会同时关闭测量超时和连续异常的 LAND 请求，仍保留诊断和异常数据过滤。
 
-### LIO 失效判断与停止发送
+输入频率自动学习，运动阈值按以下方式计算：
 
-程序通过输入消息、时间戳、位姿数值、协方差和运动连续性判断 LIO 输出是否异常。检测到异常时，只会停止发送当前异常消息，单帧异常不会立即切换模式；连续无有效输出达到超时阈值后，会异步请求 AUTO.LAND。
-
-以下情况会丢弃消息，不发布到 `/mavros/vision_pose/pose`：
-
-- LIO 停止发布消息，或者输入长时间没有更新。诊断状态会变为 `Odometry input is stale`。
-- 时间戳为零、倒序、没有递增、过旧，或超前当前 ROS 时间过多。
-- 位置或四元数包含 `NaN`、`Inf`，或者四元数接近零。
-- 协方差无效，或位置/姿态协方差超过程序内置阈值。
-- 相邻位姿位置跳变过大。
-- 根据相邻位姿计算出的线速度超过自动计算的允许值。
-- 根据相邻姿态计算出的角速度超过 `max_angular_speed`（单位 `deg/s`）。
-- 外参变换后的位姿包含非法数值。
-
-程序启动后会根据里程计消息的实际到达时间自动估计输入频率。频率估计完成后，自动生成最低输入频率、最大消息延迟和单帧最大位置跳变阈值。输入频率过低会产生诊断告警；如果消息仍在到达，频率过低本身不会单独丢弃消息。
-
-当前程序无法仅凭 LIO 里程计判断以下情况：
-
-- 位姿数值连续但已经发生缓慢的绝对漂移。
-- 位姿冻结但时间戳仍持续更新。
-- 坐标系方向配置错误但数值看起来正常。
-
-判断绝对漂移需要 GPS/RTK、动捕、UWB 或其他外部定位参考。诊断信息发布在 `/diagnostics`，可以查看输入频率、消息延迟、发布数量和各类丢弃计数。LIO 失效后，bridge 不会发送最后一帧旧位姿，最终是否触发 PX4 failsafe 由 PX4 的 EKF 和 failsafe 参数决定。
-
-检测到协方差恶化、位置跳变、线速度异常或角速度异常时，本节点只会丢弃异常帧并发布诊断，不会立即请求 PX4 切换 `AUTO.LAND`。当 `enable_vision_pose_timeout_protection: true` 时，节点在已经成功发布过 vision pose 后、连续超过 `vision_pose_timeout` 未再成功发布时，才会通过 `/mavros/set_mode` 请求 `AUTO.LAND`；启动时尚未发布任何位姿不会触发。关闭该开关后只会上报诊断错误。只要有效 vision pose 持续发布，本节点不会改变飞行模式。PX4 因估计器、Offboard、遥控器、电池或其他 failsafe 自主进入降落模式，属于飞控侧行为。
-
-### 外参配置
-
-外参由 `config/odom_to_mavros.yaml` 加载：
-
-- `extrinsic/translation/x y z`
-- `extrinsic/rotation/roll pitch yaw`
-- `extrinsic/rotation/unit`：`rad` 或 `deg`
-
-当前代码约定 YAML 中填写的是 `T_fcu_lio_body`：
-
-- `translation` 表示 LIO body 原点在飞控 FCU body 系下的位置
-- `rotation` 表示 LIO body 坐标系相对飞控 FCU body 系的姿态
-
-## 启动
-
-```bash
-roslaunch odom_to_mavros odom_to_mavros.launch
+```text
+max_linear_speed = max_flight_speed * 2
+max_position_jump = max_linear_speed / learned_input_frequency * 2
+实际位移上限 = max(max_position_jump, max_linear_speed * 相邻有效位姿时间差)
+min_input_frequency = learned_input_frequency * 0.5
+max_message_age = min(vision_pose_timeout, max(3 / learned_input_frequency, 0.2))
 ```
 
-## 配置示例
+输入低频本身只告警；如果有效测量已过期仍会触发超时。位移上限考虑实际间隔，避免高频输入短暂中断后因固定单帧距离阈值持续拒绝正常运动。
+
+## 外参
+
+YAML 填写 `T_fcu_lio_body`：LIO body 到 FCU body 的变换。
+
+- `translation`：LIO body 原点在 FCU body 系中的位置，单位米。
+- `rotation`：LIO body 相对 FCU body 的姿态，使用 `Rz(yaw) Ry(pitch) Rx(roll)`。
+- `unit`：`deg` 或 `rad`。
 
 ```yaml
 extrinsic:
@@ -116,14 +90,30 @@ extrinsic:
     yaw: 5.0
 ```
 
-## 说明
+输出公式：`T_world_fcu = T_world_lio_body * inverse(T_fcu_lio_body)`。输入应表示实际 LIO body 的位姿，不能把已经完成安装旋转的坐标系再次当作原始雷达系。节点不发布 TF。
 
-- 这个节点只做里程计转发和坐标变换，不负责 TF 发布
-- `frame_id` 只是消息标签，不会触发自动坐标变换
-- 如果外参方向填反，输出位姿会整体偏移或旋转
+## 构建与运行
 
-## 超时响应与验证边界
+放入 catkin 工作空间的 `src` 目录，安装 ROS Noetic、Eigen 和所需 ROS/MAVROS 消息依赖后：
 
-默认连续 0.2 秒无有效位姿后请求 AUTO.LAND，每 0.02 秒检查一次（非实时调度，系统负载可能增加延迟）。请求在独立线程执行，不阻塞里程计回调；失败时在后续检查中重试，同一时间仅允许一个请求。mode_sent 只代表请求已发送，不能证明飞控已进入降落。启动后从未发布过有效位姿时不触发。时间戳持续更新的冻结或缓慢漂移仍无法仅靠本节点识别。
+```bash
+cd ~/catkin_ws
+catkin_make
+source devel/setup.bash
+roslaunch odom_to_mavros odom_to_mavros.launch
+```
 
-本次修改需要在 ROS 环境编译并通过 SITL 验证断流、异常帧、服务延迟和飞控模式反馈后再用于实机。
+## 测试与当前限制
+
+无 ROS 环境时可以运行独立监控逻辑测试：
+
+```bash
+g++ -std=c++11 -Wall -Wextra -Werror -pthread -Isrc test/safety_monitor_test.cpp -o /tmp/odom_safety_test
+/tmp/odom_safety_test
+```
+
+catkin 启用测试时也会注册 `safety_monitor_test`。测试覆盖启动保护、延迟数据期限、过期数据拒绝、单帧异常、连续异常、恢复和并发读写；不能替代完整 ROS 编译、回调队列集成测试或 SITL。
+
+LAND 服务仍在独立工作线程调用，失败时每隔至少 0.5 秒重试，最多一个在途请求。`mode_sent` 仅表示请求已发送，当前代码不确认飞控实际模式；服务永久阻塞的处理、降落状态锁存和任务节点协同尚未实现。PX4 的位置丢失/Offboard 丢失保护仍需独立配置验证，发出 LAND 请求不能保证降落成功。
+
+建议在 SITL 注入：输入断流、持续延迟、NaN、协方差异常、位置跳变、里程计回调拥堵和 ROS 时间跳变；记录最后有效测量到请求发出的延迟，以及飞控实际模式变化。
