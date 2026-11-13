@@ -7,6 +7,8 @@
 #include <diagnostic_msgs/KeyValue.h>
 #include <ros/ros.h>
 
+#include <future>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -23,7 +25,7 @@ public:
     pnh.param<std::string>("frame_id", frame_id_, "world");
     pnh.param<double>("max_flight_speed", max_flight_speed_, 5.0);
     pnh.param<double>("max_angular_speed", max_angular_speed_deg_, 180.0);
-    pnh.param<double>("vision_pose_timeout", vision_pose_timeout_sec_, 1.0);
+    pnh.param<double>("vision_pose_timeout", vision_pose_timeout_sec_, 0.2);
     pnh.param<bool>("enable_vision_pose_timeout_protection",
                     enable_vision_pose_timeout_protection_, true);
 
@@ -39,6 +41,7 @@ public:
     }
     max_angular_speed_rad_ = max_angular_speed_deg_ * std::acos(-1.0) / 180.0;
 
+    max_linear_speed_ = max_flight_speed_ * 2.0;
     loadExtrinsic(pnh);
 
     vision_pub_ = nh.advertise<geometry_msgs::PoseStamped>(output_topic_, 10);
@@ -129,7 +132,9 @@ private:
         std::isfinite(msg->pose.covariance[21]) &&
         std::isfinite(msg->pose.covariance[28]) &&
         std::isfinite(msg->pose.covariance[35]) &&
-        position_variance >= 0.0 && orientation_variance >= 0.0;
+        msg->pose.covariance[0] >= 0.0 && msg->pose.covariance[7] >= 0.0 &&
+        msg->pose.covariance[14] >= 0.0 && msg->pose.covariance[21] >= 0.0 &&
+        msg->pose.covariance[28] >= 0.0 && msg->pose.covariance[35] >= 0.0;
     if (!covariance_is_valid ||
         (max_position_variance_ > 0.0 && position_variance > max_position_variance_) ||
         (max_orientation_variance_ > 0.0 && orientation_variance > max_orientation_variance_))
@@ -190,7 +195,7 @@ private:
       const Eigen::Quaterniond delta_orientation = last_orientation_.inverse() * q_world_fcu;
       const double angle = Eigen::AngleAxisd(delta_orientation).angle();
       const double angular_speed = angle / dt;
-      if ((max_position_jump_ > 0.0 && position_jump > max_position_jump_) ||
+      if ((max_position_jump_ > 0.0 && position_jump > std::max(max_position_jump_, max_linear_speed_ * dt)) ||
           (max_linear_speed_ > 0.0 && linear_speed > max_linear_speed_) ||
           (max_angular_speed_rad_ > 0.0 && angular_speed > max_angular_speed_rad_))
       {
@@ -231,33 +236,45 @@ private:
 
   void triggerAutoLand()
   {
-    if (!enable_vision_pose_timeout_protection_ || auto_land_triggered_)
-    {
+    if (!enable_vision_pose_timeout_protection_ || auto_land_triggered_ ||
+        land_request_.valid() ||
+        (!last_land_attempt_.isZero() &&
+         (ros::WallTime::now() - last_land_attempt_).toSec() < 0.5))
       return;
-    }
 
+    // Copy the client; the worker never accesses node state.
+    last_land_attempt_ = ros::WallTime::now();
+    ros::ServiceClient client = set_mode_client_;
+    land_request_ = std::async(std::launch::async, [client]() mutable {
+      mavros_msgs::SetMode request;
+      request.request.base_mode = 0;
+      request.request.custom_mode = "AUTO.LAND";
+      if (!client.call(request)) return 0;
+      return request.response.mode_sent ? 1 : 2;
+    });
     auto_land_triggered_ = true;
-    mavros_msgs::SetMode set_mode;
-    set_mode.request.base_mode = 0;
-    set_mode.request.custom_mode = "AUTO.LAND";
+    auto_land_result_ = "AUTO.LAND request in progress";
+    ROS_ERROR("Vision pose timed out; requesting AUTO.LAND asynchronously.");
+  }
 
-    if (!set_mode_client_.call(set_mode))
-    {
-      auto_land_result_ = "service call failed";
-      ROS_ERROR("Vision pose output timed out. MAVROS set_mode service call failed.");
+  void pollLandRequest()
+  {
+    if (!land_request_.valid() ||
+        land_request_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
       return;
+    try {
+      const int result = land_request_.get();
+      auto_land_result_ = result == 1 ? "AUTO.LAND request sent (mode not confirmed)"
+                                    : "AUTO.LAND request failed";
+      if (result != 1) {
+        auto_land_triggered_ = false;
+        ROS_ERROR("AUTO.LAND request failed; will retry while output is stale.");
+      }
+    } catch (const std::exception& error) {
+      auto_land_triggered_ = false;
+      auto_land_result_ = error.what();
+      ROS_ERROR("AUTO.LAND request failed: %s", error.what());
     }
-
-    if (!set_mode.response.mode_sent)
-    {
-      auto_land_result_ = "mode was not sent";
-      ROS_ERROR("Vision pose output timed out. MAVROS rejected AUTO.LAND request.");
-      return;
-    }
-
-    auto_land_result_ = "AUTO.LAND requested: vision pose output timed out";
-    ROS_ERROR("Vision pose output stopped for %.1f s. AUTO.LAND requested through MAVROS.",
-              vision_pose_timeout_sec_);
   }
 
   void updateFrequencyEstimate()
@@ -295,6 +312,7 @@ private:
 
   void diagnosticsCallback(const ros::WallTimerEvent&)
   {
+    pollLandRequest();
     const ros::WallTime now_wall = ros::WallTime::now();
     const double receive_age = received_count_ == 0
                                    ? 0.0
@@ -442,6 +460,8 @@ private:
              x, y, z, roll, pitch, yaw);
   }
 
+  std::future<int> land_request_;
+  ros::WallTime last_land_attempt_;
   ros::Subscriber odom_sub_;
   ros::Publisher vision_pub_;
   ros::Publisher diagnostics_pub_;
@@ -456,14 +476,14 @@ private:
   double max_message_age_ = 5.0;
   double max_future_offset_ = 0.1;
   double min_input_frequency_ = 5.0;
-  double diagnostic_period_ = 1.0;
+  double diagnostic_period_ = 0.02;
   double max_position_variance_ = 4.0;
   double max_orientation_variance_ = 1.0;
   double max_position_jump_ = 2.0;
   double max_linear_speed_ = 10.0;
   double max_angular_speed_deg_ = 180.0;
   double max_angular_speed_rad_ = std::acos(-1.0);
-  double vision_pose_timeout_sec_ = 1.0;
+  double vision_pose_timeout_sec_ = 0.2;
   bool enable_vision_pose_timeout_protection_ = true;
   const double frequency_window_ = 2.0;
   const double frequency_learning_window_ = 1.0;

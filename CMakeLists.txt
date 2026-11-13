@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.0.2)
 project(odom_to_mavros)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
-# add_compile_options(-std=c++11)
+add_compile_options(-std=c++11)
+find_package(Threads REQUIRED)
 
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
@@ -129,6 +130,7 @@ include_directories(
 add_executable(odom_to_mavros_node src/odom_to_mavros.cpp)
 target_link_libraries(odom_to_mavros_node
 	${catkin_LIBRARIES}
+  ${CMAKE_THREAD_LIBS_INIT}
 )
 
 #############

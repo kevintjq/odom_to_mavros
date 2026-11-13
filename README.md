@@ -27,7 +27,7 @@
 
 - `max_flight_speed`：无人机最大正常飞行速度，单位为 `m/s`。建议填实际最大速度，不要填理论极限。
 - `max_angular_speed`：无人机最大正常角速度，单位为 `deg/s`。程序内部会转换为 `rad/s` 后进行比较。
-- `vision_pose_timeout`：最后一次成功发布 vision pose 后的允许中断时间，单位为 `s`，默认 `1.0`；通常设为 `0.5` 至 `1.0`。
+- `vision_pose_timeout`：最后一次成功发布 vision pose 后的允许中断时间，单位为 `s`，默认 `0.2`，按实际链路延迟调整。
 - `enable_vision_pose_timeout_protection`：是否在 vision pose 超时时请求 `AUTO.LAND`，默认 `true`。关闭后只报告诊断错误，不改变飞行模式。
 
 输入频率不需要配置，程序会根据里程计消息的实际到达时间自动估计，适用于 FAST-LIO、其他 LIO 或任何 `nav_msgs/Odometry` 发布器。频率估计完成后会在终端打印自动生成的阈值。
@@ -37,6 +37,7 @@
 ```text
 max_linear_speed  = max_flight_speed * 2
 max_position_jump = max_linear_speed / learned_input_frequency * 2
+实际跳变上限 = max(max_position_jump, max_linear_speed * 相邻有效位姿时间差)
 min_input_frequency = learned_input_frequency * 0.5
 max_message_age = max(3 / learned_input_frequency, 0.2)
 ```
@@ -46,7 +47,7 @@ max_message_age = max(3 / learned_input_frequency, 0.2)
 ```yaml
 max_flight_speed: 5.0
 max_angular_speed: 180.0
-vision_pose_timeout: 1.0
+vision_pose_timeout: 0.2
 enable_vision_pose_timeout_protection: true
 ```
 
@@ -56,7 +57,7 @@ enable_vision_pose_timeout_protection: true
 
 ### LIO 失效判断与停止发送
 
-程序通过输入消息、时间戳、位姿数值、协方差和运动连续性判断 LIO 输出是否异常。检测到异常时，只会停止发送当前异常消息，不会主动切换 PX4 飞行模式、降落或执行其他飞控控制。
+程序通过输入消息、时间戳、位姿数值、协方差和运动连续性判断 LIO 输出是否异常。检测到异常时，只会停止发送当前异常消息，单帧异常不会立即切换模式；连续无有效输出达到超时阈值后，会异步请求 AUTO.LAND。
 
 以下情况会丢弃消息，不发布到 `/mavros/vision_pose/pose`：
 
@@ -120,3 +121,9 @@ extrinsic:
 - 这个节点只做里程计转发和坐标变换，不负责 TF 发布
 - `frame_id` 只是消息标签，不会触发自动坐标变换
 - 如果外参方向填反，输出位姿会整体偏移或旋转
+
+## 超时响应与验证边界
+
+默认连续 0.2 秒无有效位姿后请求 AUTO.LAND，每 0.02 秒检查一次（非实时调度，系统负载可能增加延迟）。请求在独立线程执行，不阻塞里程计回调；失败时在后续检查中重试，同一时间仅允许一个请求。mode_sent 只代表请求已发送，不能证明飞控已进入降落。启动后从未发布过有效位姿时不触发。时间戳持续更新的冻结或缓慢漂移仍无法仅靠本节点识别。
+
+本次修改需要在 ROS 环境编译并通过 SITL 验证断流、异常帧、服务延迟和飞控模式反馈后再用于实机。
