@@ -27,6 +27,7 @@
 | --- | --- |
 | 位姿桥接 | 发布位置与四元数，默认输出到 `/mavros/vision_pose/pose` |
 | 外参转换 | 从 YAML 加载 LIO body 到 FCU body 的 6DoF 外参 |
+| 终端对比 | 同屏查看 LIO 原始位姿、桥接输出和 PX4 本地估计 |
 | 输入检查 | 检查时间戳、数值、协方差、运动连续性及窗口异常比例 |
 | 单次任务 | 触发后保持待发送；成功发送一次后不再重复请求 |
 
@@ -80,9 +81,10 @@ roslaunch odom_to_mavros odom_to_mavros.launch
 
 ## 终端位姿对比
 
-启动桥接后，在另一个已加载工作空间环境的终端运行看板（ROS Noetic / Python 3）。
+桥接节点运行后，新开一个终端标签页，加载同一个工作空间并启动看板。看板使用 ROS Noetic 和 Python 3，按 `Ctrl+C` 可退出该终端中的看板。
 
 ```bash
+source ~/catkin_ws/devel/setup.bash
 roslaunch odom_to_mavros pose_compare.launch
 ```
 
@@ -92,9 +94,25 @@ roslaunch odom_to_mavros pose_compare.launch
 | `VISION OUT` | 外参转换后的桥接输出 | `/mavros/vision_pose/pose` |
 | `PX4` | 飞控本地估计 | `/mavros/local_position/pose` |
 
-三列按行对照 XYZ（米）和 Roll、Pitch、Yaw（度）。底部显示每列的坐标系和距上次收包的时间，以及 PX4 的飞行模式、连接和解锁状态。位姿未收到、数值无效或满 1 秒未更新时，对应数值显示 `--`。看板展示各话题的最新接收值，逐轴对比前请确认坐标轴、原点和时序一致。
+同一行可对照 XYZ（米）与 Roll、Pitch、Yaw（度）。`Frame` 显示坐标系名称，`RX age` 显示距上次收包的时间。末尾可查看 PX4 的飞行模式、连接和解锁状态。
 
-看板会读取同一命名空间下 `odom_to_mavros` 节点配置的输入和输出话题。也可以用 `rosrun odom_to_mavros pose_compare.py` 直接启动，并在命令后追加 `_input_topic:=...`、`_output_topic:=...`、`_px4_pose_topic:=...` 或 `_state_topic:=...` 覆盖订阅话题。按 `Ctrl+C` 退出看板。
+| 收包状态 | 含义 |
+| --- | --- |
+| `LIVE` | 最近 1 秒内收到数值有效的位姿 |
+| `WAIT` | 等待首帧，对应数值显示 `--` |
+| `INVALID` | 最新位姿数值无效，对应数值显示 `--` |
+| `STALE` | 满 1 秒未收到更新，对应数值显示 `--` |
+
+看板显示各话题最新收到的样本。逐轴比较数值前，请确认坐标轴方向和原点一致，并选取时间接近的样本。
+
+<details>
+<summary>直接运行脚本与自定义话题</summary>
+
+加载工作空间后，也可以在仓库根目录执行 `python3 scripts/pose_compare.py`，或用 `rosrun odom_to_mavros pose_compare.py` 启动。
+
+看板会读取同一命名空间下桥接节点的输入和输出话题。直接运行脚本时，可在命令后追加 `_input_topic:=...`、`_output_topic:=...`、`_px4_pose_topic:=...` 或 `_state_topic:=...` 覆盖订阅话题。
+
+</details>
 
 ## 接口与数据
 
