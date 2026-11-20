@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
+  <a href="#终端位姿对比">终端位姿对比</a> ·
   <a href="#接口与数据">接口与数据</a> ·
   <a href="#外参配置">外参配置</a> ·
   <a href="#失效保护">失效保护</a> ·
@@ -76,6 +77,24 @@ roslaunch odom_to_mavros odom_to_mavros.launch
 ```
 
 > 默认开启保护。启动后 **5 秒**仍无首帧有效数据也会触发 LAND 请求，地面冷启动同样适用。请先运行上游，或按实际初始化时间调整 `startup_timeout`。
+
+## 终端位姿对比
+
+启动桥接后，在另一个已加载工作空间环境的终端运行看板（ROS Noetic / Python 3）。
+
+```bash
+rosrun odom_to_mavros pose_compare.py
+```
+
+| 列 | 数据来源 | 默认话题 |
+| --- | --- | --- |
+| `LIO` | 原始里程计 | `/Odometry` |
+| `VISION OUT` | 外参转换后的桥接输出 | `/mavros/vision_pose/pose` |
+| `PX4` | 飞控本地估计 | `/mavros/local_position/pose` |
+
+三列按行对照 XYZ（米）和 Roll、Pitch、Yaw（度）。底部显示每列的坐标系和距上次收包的时间，以及 PX4 的飞行模式、连接和解锁状态。位姿未收到、数值无效或满 1 秒未更新时，对应数值显示 `--`。看板展示各话题的最新接收值，逐轴对比前请确认坐标轴、原点和时序一致。
+
+看板会读取同一命名空间下 `odom_to_mavros` 节点配置的输入和输出话题。自定义部署可用 `_input_topic:=...`、`_output_topic:=...`、`_px4_pose_topic:=...`、`_state_topic:=...` 覆盖订阅话题。按 `Ctrl+C` 退出。
 
 ## 接口与数据
 

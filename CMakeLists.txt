@@ -29,3 +29,7 @@ target_link_libraries(odom_to_mavros_node
 if(catkin_EXPORTED_TARGETS)
   add_dependencies(odom_to_mavros_node ${catkin_EXPORTED_TARGETS})
 endif()
+
+catkin_install_python(PROGRAMS scripts/pose_compare.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
