@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="odom_to_mavros" type="pose_compare.py" name="$(anon pose_compare)" output="screen" />
+</launch>

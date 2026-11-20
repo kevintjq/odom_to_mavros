@@ -33,3 +33,7 @@ endif()
 catkin_install_python(PROGRAMS scripts/pose_compare.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+install(FILES launch/pose_compare.launch
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+)

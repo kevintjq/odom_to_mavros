@@ -83,7 +83,7 @@ roslaunch odom_to_mavros odom_to_mavros.launch
 启动桥接后，在另一个已加载工作空间环境的终端运行看板（ROS Noetic / Python 3）。
 
 ```bash
-rosrun odom_to_mavros pose_compare.py
+roslaunch odom_to_mavros pose_compare.launch
 ```
 
 | 列 | 数据来源 | 默认话题 |
@@ -94,7 +94,7 @@ rosrun odom_to_mavros pose_compare.py
 
 三列按行对照 XYZ（米）和 Roll、Pitch、Yaw（度）。底部显示每列的坐标系和距上次收包的时间，以及 PX4 的飞行模式、连接和解锁状态。位姿未收到、数值无效或满 1 秒未更新时，对应数值显示 `--`。看板展示各话题的最新接收值，逐轴对比前请确认坐标轴、原点和时序一致。
 
-看板会读取同一命名空间下 `odom_to_mavros` 节点配置的输入和输出话题。自定义部署可用 `_input_topic:=...`、`_output_topic:=...`、`_px4_pose_topic:=...`、`_state_topic:=...` 覆盖订阅话题。按 `Ctrl+C` 退出。
+看板会读取同一命名空间下 `odom_to_mavros` 节点配置的输入和输出话题。也可以用 `rosrun odom_to_mavros pose_compare.py` 直接启动，并在命令后追加 `_input_topic:=...`、`_output_topic:=...`、`_px4_pose_topic:=...` 或 `_state_topic:=...` 覆盖订阅话题。按 `Ctrl+C` 退出看板。
 
 ## 接口与数据
 
